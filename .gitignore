@@ -1,18 +1,32 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+# Python / local environment
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
 
-# Other files and folders
-.settings/
+# Build outputs
+build/
+dist/
+UsageWidget/
+*.spec.bak
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
+# Local runtime data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
 
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+# Smoke-test exports and temporary reports
+*-smoke*.csv
+*-smoke*.html
+*-smoke*.png
+*preview*.png
+readonly-test-local*/
+
+# Editor / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
