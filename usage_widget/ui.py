@@ -1648,6 +1648,8 @@ class StatsDialog(QDialog):
         self._line_chart_cache: tuple[str, dict] | None = None
         self._artist_cache: tuple[str, list] | None = None
         self._chart_cache_time = 0.0
+        self._timeline_limit = 120
+        self._timeline_loaded_key = ""
         self.setWindowTitle(f"使用数据分析 · v{__version__}")
         self.setWindowIcon(build_app_icon())
         self.setMinimumSize(1020, 720)
@@ -1674,6 +1676,8 @@ class StatsDialog(QDialog):
         self.video_total.setObjectName("statsPill")
         self.learning_total = QLabel()
         self.learning_total.setObjectName("statsPill")
+        self.detail_status = QLabel("准备加载数据")
+        self.detail_status.setObjectName("detailStatus")
         self.refresh_button = QPushButton("刷新")
         self.refresh_button.clicked.connect(self.refresh)
         report_button = QPushButton("导出报告")
@@ -1691,6 +1695,7 @@ class StatsDialog(QDialog):
         header.addWidget(self.foreground_total)
         header.addWidget(self.video_total)
         header.addWidget(self.media_total)
+        header.addWidget(self.detail_status)
         header.addWidget(definition_button)
         header.addWidget(music_export_button)
         header.addWidget(learning_export_button)
@@ -1715,6 +1720,7 @@ class StatsDialog(QDialog):
         self.category_table = self._make_table(["分类", "总时长", "占比", "注视时长", "播放/后台", "条目数", "来源类型", "最后记录"], sort_column=1)
         self.goal_table = self._make_table(["目标", "方向", "当前", "目标值", "状态"], sort_column=2)
         self.timeline_table = self._make_table(["开始", "类型", "标题", "应用", "分类", "主题", "时长"], sort_column=0)
+        self.timeline_tab = self._make_timeline_tab()
         for table, kind in (
             (self.web_table, "web"),
             (self.video_table, "video"),
@@ -1760,7 +1766,8 @@ class StatsDialog(QDialog):
         self.tabs.addTab(self.learning_analysis_tab, "学习")
         self.tabs.addTab(self.category_table, "分类")
         self.tabs.addTab(self.goal_table, "目标")
-        self.tabs.addTab(self.timeline_table, "时间线")
+        self.tabs.addTab(self.timeline_tab, "时间线")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
 
         note = QLabel("网页注视和窗口标题统计的是前台焦点；音乐播放统计的是后台播放内容，两者不会混在一起计算。")
@@ -1798,6 +1805,15 @@ class StatsDialog(QDialog):
                 padding: 5px 9px;
                 color: #334155;
                 font-weight: 650;
+            }
+            QLabel#detailStatus {
+                color: #607089;
+                padding: 5px 8px;
+                font-size: 12px;
+            }
+            QLabel#timelineHint {
+                color: #607089;
+                padding: 3px 4px;
             }
             QLabel { color: #17202a; }
             QComboBox { padding: 6px 10px; border: 1px solid #b9c6d4; border-radius: 6px; background: #ffffff; }
@@ -2010,6 +2026,23 @@ class StatsDialog(QDialog):
         layout.addWidget(self.learning_analysis_table, 1)
         return tab
 
+    def _make_timeline_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        header = QHBoxLayout()
+        self.timeline_hint = QLabel("时间线按需加载，默认只显示最近 120 条，避免大量历史事件导致界面卡顿。")
+        self.timeline_hint.setObjectName("timelineHint")
+        self.timeline_more_button = QPushButton("加载更多")
+        self.timeline_more_button.setToolTip("每次增加 200 条时间线记录")
+        self.timeline_more_button.clicked.connect(self._load_more_timeline)
+        header.addWidget(self.timeline_hint, 1)
+        header.addWidget(self.timeline_more_button)
+        layout.addLayout(header)
+        layout.addWidget(self.timeline_table, 1)
+        return tab
+
     def _make_table(self, headers: list[str], sort_column: int | None = None) -> QTableWidget:
         table = QTableWidget(0, len(headers))
         table.setHorizontalHeaderLabels(headers)
@@ -2018,9 +2051,13 @@ class StatsDialog(QDialog):
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setWordWrap(False)
+        table.setTextElideMode(Qt.TextElideMode.ElideRight)
         table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(28)
         table.horizontalHeader().setStretchLastSection(True)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.horizontalHeader().setDefaultSectionSize(150)
         return table
 
     @staticmethod
@@ -2127,6 +2164,7 @@ class StatsDialog(QDialog):
         table.setUpdatesEnabled(False)
         table.setSortingEnabled(False)
         try:
+            table.clearContents()
             table.setRowCount(len(rows))
             for row_index, row_values in enumerate(rows):
                 for col_index, value in enumerate(row_values):
@@ -2146,6 +2184,25 @@ class StatsDialog(QDialog):
                 table.sortItems(sort_column, Qt.SortOrder.DescendingOrder)
         finally:
             table.setUpdatesEnabled(True)
+
+    def _range_key(self) -> str:
+        return str(self.range_combo.currentData())
+
+    def _date_range_key(self) -> str:
+        start_date, end_date = self.storage.date_range_for_preset(self._range_key())
+        return f"{start_date.isoformat()}:{end_date.isoformat()}:{self._timeline_limit}"
+
+    def _is_timeline_tab_active(self) -> bool:
+        return self.tabs.currentWidget() is self.timeline_tab
+
+    def _on_tab_changed(self, _index: int) -> None:
+        if self._is_timeline_tab_active() and self._timeline_loaded_key != self._date_range_key():
+            QTimer.singleShot(0, self.refresh)
+
+    def _load_more_timeline(self) -> None:
+        self._timeline_limit = min(self._timeline_limit + 200, 2000)
+        self._timeline_loaded_key = ""
+        self.refresh()
 
     def _hourly_rows(self, timeline_rows: list) -> list[tuple[int, float, float, float, float]]:
         buckets = [[0.0, 0.0, 0.0, 0.0] for _ in range(24)]
@@ -2208,7 +2265,8 @@ class StatsDialog(QDialog):
             self._refreshing = False
 
     def _do_refresh(self) -> None:
-        start_date, end_date = self.storage.date_range_for_preset(str(self.range_combo.currentData()))
+        start_date, end_date = self.storage.date_range_for_preset(self._range_key())
+        active_timeline = self._is_timeline_tab_active()
         # ---- All queries (synchronous, fast with indexes) ----
         foreground = self.storage.foreground_total_range(start_date, end_date)
         media = self.storage.media_total_range(start_date, end_date)
@@ -2222,8 +2280,7 @@ class StatsDialog(QDialog):
         win_rows = list(self.storage.content_rows_range(start_date, end_date, kind="window_title", limit=200))
         cat_rows = list(self.storage.category_summary_range(start_date, end_date))
         hourly_rows = self.storage.hourly_activity_range(start_date, end_date)
-        tl_limit = 200 if (end_date - start_date).days <= 1 else 600
-        tl_rows = list(self.storage.timeline_rows_range(start_date, end_date, limit=tl_limit))
+        tl_rows = list(self.storage.timeline_rows_range(start_date, end_date, limit=self._timeline_limit)) if active_timeline else []
         domain_rows = list(self.storage.domain_summary_range(start_date, end_date, limit=100))
         vd_rows = list(self.storage.video_domain_summary_range(start_date, end_date, limit=100))
         music_analysis = self.storage.music_analysis_range(start_date, end_date, limit=200)
@@ -2237,6 +2294,10 @@ class StatsDialog(QDialog):
         self.video_total.setText(f"视频播放 {format_duration(video)}")
         self.media_total.setText(f"音乐播放 {format_duration(media)}")
         self.learning_total.setText(f"学习 {format_duration(learning_total)}")
+        self.detail_status.setText(
+            f"{start_date.isoformat()} ~ {end_date.isoformat()} · "
+            f"程序 {len(process_rows)} · 网页 {len(web_rows)} · 视频 {len(vp_rows)} · 分类 {len(cat_rows)}"
+        )
 
         # ---- Overview cards ----
         web_total = sum(float(r["attention_seconds"] or 0) for r in web_rows)
@@ -2388,17 +2449,27 @@ class StatsDialog(QDialog):
         else:
             self.streak_label.setVisible(False)
 
-        # ---- Timeline ----
-        tl_table_rows = [[
-            str(r["start_time"]), str(r["kind"]), str(r["title"]),
-            str(r["app_name"]), str(r["category"]),
-            str(r["learning_topic"] or "-"),
-            self._duration_cell(float(r["seconds"] or 0)),
-        ] for r in tl_rows]
-        self._set_rows(self.timeline_table, tl_table_rows)
+        # ---- Timeline: lazy-loaded because large event tables can freeze QTableWidget.
+        if active_timeline:
+            tl_table_rows = [[
+                str(r["start_time"]), str(r["kind"]), str(r["title"]),
+                str(r["app_name"]), str(r["category"]),
+                str(r["learning_topic"] or "-"),
+                self._duration_cell(float(r["seconds"] or 0)),
+            ] for r in tl_rows]
+            self._set_rows(self.timeline_table, tl_table_rows)
+            self._timeline_loaded_key = self._date_range_key()
+            more_text = "可继续加载更多" if len(tl_rows) >= self._timeline_limit else "已显示当前范围内全部可用记录"
+            self.timeline_hint.setText(
+                f"时间线已加载最近 {len(tl_rows)} 条 · 上限 {self._timeline_limit} · {more_text}"
+            )
+            self.timeline_more_button.setEnabled(len(tl_rows) >= self._timeline_limit and self._timeline_limit < 2000)
+        elif self.timeline_table.rowCount() == 0:
+            self.timeline_hint.setText("时间线按需加载：切换到本页后才查询最近事件，避免详情刷新时卡住。")
 
-        # ---- Deferred: heatmap only (very heavy) ----
-        QTimer.singleShot(100, lambda: self._render_heatmap(start_date, end_date))
+        # ---- Deferred charts: only render while the visual tabs are relevant.
+        if self.tabs.currentWidget() in {self.overview_tab, self.trend_tab}:
+            QTimer.singleShot(100, lambda: self._render_heatmap(start_date, end_date))
 
     def _render_heatmap(self, start_date, end_date) -> None:
         """Deferred: heavy heatmap + week comparison charts."""
