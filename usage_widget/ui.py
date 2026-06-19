@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QFileInfo, QPoint, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QDate, QEvent, QFileInfo, QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFontMetrics, QIcon, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDateEdit,
     QDoubleSpinBox,
     QFileDialog,
     QFileIconProvider,
@@ -1667,7 +1668,23 @@ class StatsDialog(QDialog):
         self.range_combo.addItem("最近 7 天", "7d")
         self.range_combo.addItem("最近 30 天", "30d")
         self.range_combo.addItem("本周", "week")
-        self.range_combo.currentIndexChanged.connect(self.refresh)
+        self.range_combo.addItem("自定义", "custom")
+        self.range_combo.currentIndexChanged.connect(self._on_range_changed)
+        today_qdate = QDate.currentDate()
+        self.start_date_edit = QDateEdit(today_qdate)
+        self.start_date_edit.setCalendarPopup(True)
+        self.start_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.start_date_edit.setMaximumWidth(118)
+        self.start_date_edit.dateChanged.connect(self._on_custom_date_changed)
+        self.end_date_edit = QDateEdit(today_qdate)
+        self.end_date_edit.setCalendarPopup(True)
+        self.end_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.end_date_edit.setMaximumWidth(118)
+        self.end_date_edit.dateChanged.connect(self._on_custom_date_changed)
+        self._custom_refresh_timer = QTimer(self)
+        self._custom_refresh_timer.setSingleShot(True)
+        self._custom_refresh_timer.setInterval(180)
+        self._custom_refresh_timer.timeout.connect(self.refresh)
         self.foreground_total = QLabel()
         self.foreground_total.setObjectName("statsPill")
         self.media_total = QLabel()
@@ -1690,6 +1707,10 @@ class StatsDialog(QDialog):
         definition_button.clicked.connect(self.show_data_definitions)
         header.addWidget(title)
         header.addWidget(self.range_combo)
+        header.addWidget(self.start_date_edit)
+        self.date_separator_label = QLabel("至")
+        header.addWidget(self.date_separator_label)
+        header.addWidget(self.end_date_edit)
         header.addStretch(1)
         header.addWidget(self.learning_total)
         header.addWidget(self.foreground_total)
@@ -1702,6 +1723,10 @@ class StatsDialog(QDialog):
         header.addWidget(report_button)
         header.addWidget(self.refresh_button)
         root.addLayout(header)
+        self.compare_label = QLabel("对比上一周期：准备加载")
+        self.compare_label.setObjectName("compareLabel")
+        self.compare_label.setWordWrap(True)
+        root.addWidget(self.compare_label)
 
         self.tabs = QTabWidget()
         self.overview_tab = self._make_overview_tab()
@@ -1811,6 +1836,14 @@ class StatsDialog(QDialog):
                 padding: 5px 8px;
                 font-size: 12px;
             }
+            QLabel#compareLabel {
+                background: #ffffff;
+                border: 1px solid #d9e1ea;
+                border-radius: 8px;
+                color: #334155;
+                padding: 7px 10px;
+                font-weight: 650;
+            }
             QLabel#timelineHint {
                 color: #607089;
                 padding: 3px 4px;
@@ -1845,6 +1878,7 @@ class StatsDialog(QDialog):
             }
             """
         )
+        self._sync_custom_date_controls()
         QTimer.singleShot(0, self.refresh)
 
     def _make_chart_panel(self, chart: QWidget) -> QFrame:
@@ -2188,8 +2222,57 @@ class StatsDialog(QDialog):
     def _range_key(self) -> str:
         return str(self.range_combo.currentData())
 
+    @staticmethod
+    def _qdate_to_date(value: QDate) -> date:
+        return date(value.year(), value.month(), value.day())
+
+    @staticmethod
+    def _date_to_qdate(value: date) -> QDate:
+        return QDate(value.year, value.month, value.day)
+
+    def _current_date_range(self) -> tuple[date, date]:
+        if self._range_key() == "custom":
+            start_date = self._qdate_to_date(self.start_date_edit.date())
+            end_date = self._qdate_to_date(self.end_date_edit.date())
+            if end_date < start_date:
+                start_date, end_date = end_date, start_date
+            return start_date, end_date
+        return self.storage.date_range_for_preset(self._range_key())
+
+    def _sync_custom_date_controls(self) -> None:
+        is_custom = self._range_key() == "custom"
+        if not is_custom:
+            start_date, end_date = self.storage.date_range_for_preset(self._range_key())
+            self.start_date_edit.blockSignals(True)
+            self.end_date_edit.blockSignals(True)
+            self.start_date_edit.setDate(self._date_to_qdate(start_date))
+            self.end_date_edit.setDate(self._date_to_qdate(end_date))
+            self.start_date_edit.blockSignals(False)
+            self.end_date_edit.blockSignals(False)
+        self.start_date_edit.setVisible(is_custom)
+        self.date_separator_label.setVisible(is_custom)
+        self.end_date_edit.setVisible(is_custom)
+
+    def _on_range_changed(self) -> None:
+        self._timeline_loaded_key = ""
+        self._custom_refresh_timer.stop()
+        self._sync_custom_date_controls()
+        self.refresh()
+
+    def _on_custom_date_changed(self) -> None:
+        if self._range_key() != "custom":
+            return
+        self._timeline_loaded_key = ""
+        self._custom_refresh_timer.start()
+
+    def _previous_date_range(self, start_date: date, end_date: date) -> tuple[date, date]:
+        span_days = max(1, (end_date - start_date).days + 1)
+        previous_end = start_date - timedelta(days=1)
+        previous_start = previous_end - timedelta(days=span_days - 1)
+        return previous_start, previous_end
+
     def _date_range_key(self) -> str:
-        start_date, end_date = self.storage.date_range_for_preset(self._range_key())
+        start_date, end_date = self._current_date_range()
         return f"{start_date.isoformat()}:{end_date.isoformat()}:{self._timeline_limit}"
 
     def _is_timeline_tab_active(self) -> bool:
@@ -2203,6 +2286,14 @@ class StatsDialog(QDialog):
         self._timeline_limit = min(self._timeline_limit + 200, 2000)
         self._timeline_loaded_key = ""
         self.refresh()
+
+    def _compare_text(self, current: float, previous: float) -> str:
+        if previous <= 0:
+            return f"{format_duration(current)} / 上期无数据"
+        delta = current - previous
+        pct = delta / previous * 100.0
+        direction = "↑" if delta > 0 else "↓" if delta < 0 else "→"
+        return f"{format_duration(current)} {direction} {abs(pct):.0f}%"
 
     def _hourly_rows(self, timeline_rows: list) -> list[tuple[int, float, float, float, float]]:
         buckets = [[0.0, 0.0, 0.0, 0.0] for _ in range(24)]
@@ -2265,13 +2356,18 @@ class StatsDialog(QDialog):
             self._refreshing = False
 
     def _do_refresh(self) -> None:
-        start_date, end_date = self.storage.date_range_for_preset(self._range_key())
+        start_date, end_date = self._current_date_range()
         active_timeline = self._is_timeline_tab_active()
+        previous_start, previous_end = self._previous_date_range(start_date, end_date)
         # ---- All queries (synchronous, fast with indexes) ----
         foreground = self.storage.foreground_total_range(start_date, end_date)
         media = self.storage.media_total_range(start_date, end_date)
         video = self.storage.video_total_range(start_date, end_date)
         learning_total = self.storage.learning_total_range(start_date, end_date)
+        prev_foreground = self.storage.foreground_total_range(previous_start, previous_end)
+        prev_media = self.storage.media_total_range(previous_start, previous_end)
+        prev_video = self.storage.video_total_range(previous_start, previous_end)
+        prev_learning = self.storage.learning_total_range(previous_start, previous_end)
         learning_topics_count = len(self.storage.learning_topic_summary_range(start_date, end_date, limit=100))
         process_rows = list(self.storage.process_rows_range(start_date, end_date, limit=120))
         web_rows = list(self.storage.content_rows_range(start_date, end_date, kind="web_page", limit=200))
@@ -2297,6 +2393,14 @@ class StatsDialog(QDialog):
         self.detail_status.setText(
             f"{start_date.isoformat()} ~ {end_date.isoformat()} · "
             f"程序 {len(process_rows)} · 网页 {len(web_rows)} · 视频 {len(vp_rows)} · 分类 {len(cat_rows)}"
+        )
+        self.compare_label.setText(
+            "对比上一周期 "
+            f"{previous_start.isoformat()} ~ {previous_end.isoformat()}："
+            f"前台 {self._compare_text(foreground, prev_foreground)} · "
+            f"学习 {self._compare_text(learning_total, prev_learning)} · "
+            f"视频 {self._compare_text(video, prev_video)} · "
+            f"音乐 {self._compare_text(media, prev_media)}"
         )
 
         # ---- Overview cards ----
@@ -2501,7 +2605,7 @@ class StatsDialog(QDialog):
             pass
 
     def export_report(self) -> None:
-        start_date, end_date = self.storage.date_range_for_preset(str(self.range_combo.currentData()))
+        start_date, end_date = self._current_date_range()
         default_name = f"usage-widget-report-{start_date.isoformat()}-{end_date.isoformat()}.html"
         path, _ = QFileDialog.getSaveFileName(self, "导出 HTML 报告", default_name, "HTML Files (*.html)")
         if not path:
@@ -2510,7 +2614,7 @@ class StatsDialog(QDialog):
         QMessageBox.information(self, "导出完成", f"已导出到：\n{path}")
 
     def export_music_csv(self) -> None:
-        start_date, end_date = self.storage.date_range_for_preset(str(self.range_combo.currentData()))
+        start_date, end_date = self._current_date_range()
         default_name = f"usage-widget-music-{start_date.isoformat()}-{end_date.isoformat()}.csv"
         path, _ = QFileDialog.getSaveFileName(self, "导出音乐分析 CSV", default_name, "CSV Files (*.csv)")
         if not path:
@@ -2519,7 +2623,7 @@ class StatsDialog(QDialog):
         QMessageBox.information(self, "导出完成", f"已导出到：\n{path}")
 
     def export_learning_csv(self) -> None:
-        start_date, end_date = self.storage.date_range_for_preset(str(self.range_combo.currentData()))
+        start_date, end_date = self._current_date_range()
         default_name = f"usage-widget-learning-{start_date.isoformat()}-{end_date.isoformat()}.csv"
         path, _ = QFileDialog.getSaveFileName(self, "导出学习分析 CSV", default_name, "CSV Files (*.csv)")
         if not path:
