@@ -9,6 +9,11 @@ import urllib.request
 import html as html_lib
 from dataclasses import dataclass
 
+from . import __version__
+
+
+USER_AGENT = f"UsageWidget/{__version__}"
+DESKTOP_USER_AGENT = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) {USER_AGENT}"
 
 LEARNING_INTENT_HINTS = {
     "course",
@@ -542,7 +547,7 @@ class OnlineLearningTopicClassifier:
             return LearningTopicResult("", 0.0, f"wiki-{lang}")
 
     def _fetch_json(self, url: str) -> dict:
-        request = urllib.request.Request(url, headers={"User-Agent": "UsageWidget/5.44.1"})
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(request, timeout=3.0) as response:
             raw = response.read(256 * 1024)
         return json.loads(raw.decode("utf-8", errors="replace"))
@@ -551,7 +556,7 @@ class OnlineLearningTopicClassifier:
         request = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) UsageWidget/5.44.1",
+                "User-Agent": DESKTOP_USER_AGENT,
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
             },
         )
