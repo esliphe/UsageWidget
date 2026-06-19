@@ -887,25 +887,10 @@ class SettingsDialog(QDialog):
         self.pause_box.setChecked(settings.pause_tracking)
         general_layout.addWidget(self.pause_box)
 
-        idle_row = QHBoxLayout()
-        idle_label = QLabel("空闲阈值（秒）")
-        self.idle_spin = QSpinBox()
-        self.idle_spin.setRange(30, 3600)
-        self.idle_spin.setSingleStep(30)
-        self.idle_spin.setValue(settings.idle_threshold_seconds)
-        idle_row.addWidget(idle_label)
-        idle_row.addWidget(self.idle_spin, 1)
-        general_layout.addLayout(idle_row)
-
-        retention_row = QHBoxLayout()
-        retention_label = QLabel("时间线保留（天，0 为永久）")
-        self.retention_spin = QSpinBox()
-        self.retention_spin.setRange(0, 3650)
-        self.retention_spin.setSingleStep(30)
-        self.retention_spin.setValue(settings.timeline_retention_days)
-        retention_row.addWidget(retention_label)
-        retention_row.addWidget(self.retention_spin, 1)
-        general_layout.addLayout(retention_row)
+        time_settings_tip = QLabel("空闲判定、时间线保留和清理策略已移到“时间管理”页。")
+        time_settings_tip.setObjectName("settingsHint")
+        time_settings_tip.setWordWrap(True)
+        general_layout.addWidget(time_settings_tip)
 
         theme_row = QHBoxLayout()
         theme_label = QLabel("主题")
@@ -922,6 +907,74 @@ class SettingsDialog(QDialog):
         self.window_opacity = self._slider_row(general_layout, "整体透明度", 40, 100, int(settings.window_opacity * 100))
         self.background_alpha = self._slider_row(general_layout, "背景透明度", 40, 245, settings.background_alpha)
         self.settings_tabs.addTab(general, "常规")
+
+        time_panel = QFrame()
+        time_panel.setObjectName("settingsPanel")
+        time_layout = QVBoxLayout(time_panel)
+        time_layout.setContentsMargins(12, 12, 12, 12)
+        time_layout.setSpacing(10)
+        time_layout.addWidget(self._section_label("记录节奏"))
+        idle_note = QLabel("空闲阈值决定键鼠无输入多久后暂停前台注视累计。看视频、听音乐或使用手写应用时，可由常规页的豁免开关继续累计。")
+        idle_note.setObjectName("settingsHint")
+        idle_note.setWordWrap(True)
+        time_layout.addWidget(idle_note)
+        idle_row = QHBoxLayout()
+        idle_label = QLabel("空闲判定")
+        self.idle_preset_combo = QComboBox()
+        self.idle_preset_combo.addItem("灵敏：1 分钟", 60)
+        self.idle_preset_combo.addItem("均衡：3 分钟（推荐）", 180)
+        self.idle_preset_combo.addItem("宽松：5 分钟", 300)
+        self.idle_preset_combo.addItem("长时间阅读：10 分钟", 600)
+        self.idle_preset_combo.addItem("自定义", -1)
+        self.idle_spin = QSpinBox()
+        self.idle_spin.setRange(30, 3600)
+        self.idle_spin.setSingleStep(30)
+        self.idle_spin.setSuffix(" 秒")
+        self.idle_spin.setValue(settings.idle_threshold_seconds)
+        idle_row.addWidget(idle_label)
+        idle_row.addWidget(self.idle_preset_combo, 1)
+        idle_row.addWidget(self.idle_spin)
+        time_layout.addLayout(idle_row)
+
+        time_layout.addWidget(self._section_label("历史管理"))
+        retention_note = QLabel("时间线是最细的事件明细，保留越久越便于回看，但数据库会更大；汇总统计不依赖完整时间线。")
+        retention_note.setObjectName("settingsHint")
+        retention_note.setWordWrap(True)
+        time_layout.addWidget(retention_note)
+        retention_row = QHBoxLayout()
+        retention_label = QLabel("时间线保留")
+        self.retention_preset_combo = QComboBox()
+        self.retention_preset_combo.addItem("30 天", 30)
+        self.retention_preset_combo.addItem("90 天（推荐）", 90)
+        self.retention_preset_combo.addItem("180 天", 180)
+        self.retention_preset_combo.addItem("365 天", 365)
+        self.retention_preset_combo.addItem("永久保留", 0)
+        self.retention_preset_combo.addItem("自定义", -1)
+        self.retention_spin = QSpinBox()
+        self.retention_spin.setRange(0, 3650)
+        self.retention_spin.setSingleStep(30)
+        self.retention_spin.setSuffix(" 天")
+        self.retention_spin.setSpecialValueText("永久")
+        self.retention_spin.setValue(settings.timeline_retention_days)
+        retention_row.addWidget(retention_label)
+        retention_row.addWidget(self.retention_preset_combo, 1)
+        retention_row.addWidget(self.retention_spin)
+        time_layout.addLayout(retention_row)
+
+        self.time_settings_summary = QLabel()
+        self.time_settings_summary.setObjectName("timeSummary")
+        self.time_settings_summary.setWordWrap(True)
+        time_layout.addWidget(self.time_settings_summary)
+        time_layout.addStretch(1)
+        self._sync_time_preset_combos()
+        self.idle_preset_combo.currentIndexChanged.connect(self._apply_idle_preset)
+        self.retention_preset_combo.currentIndexChanged.connect(self._apply_retention_preset)
+        self.idle_spin.valueChanged.connect(self._sync_idle_preset_from_spin)
+        self.retention_spin.valueChanged.connect(self._sync_retention_preset_from_spin)
+        self.idle_spin.valueChanged.connect(self._update_time_management_summary)
+        self.retention_spin.valueChanged.connect(self._update_time_management_summary)
+        self._update_time_management_summary()
+        self.settings_tabs.addTab(time_panel, "时间管理")
 
         ignore_panel = QFrame()
         ignore_panel.setObjectName("settingsPanel")
@@ -1093,6 +1146,14 @@ class SettingsDialog(QDialog):
             QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Segoe UI"; }
             QFrame#settingsPanel { background: white; border: 1px solid #d9e1ea; border-radius: 8px; }
             QLabel#sectionLabel { color: #607089; font-weight: 700; }
+            QLabel#settingsHint { color: #64748b; font-size: 12px; }
+            QLabel#timeSummary {
+                background: #f8fafc;
+                border: 1px solid #d9e1ea;
+                border-radius: 8px;
+                color: #334155;
+                padding: 9px 10px;
+            }
             QLineEdit, QListWidget, QComboBox, QTableWidget {
                 border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px; background: white;
             }
@@ -1135,6 +1196,46 @@ class SettingsDialog(QDialog):
         row.addWidget(value_label)
         parent_layout.addLayout(row)
         return slider
+
+    def _set_combo_to_data(self, combo: QComboBox, data: int) -> None:
+        index = combo.findData(data)
+        if index < 0:
+            index = combo.findData(-1)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(max(0, index))
+        combo.blockSignals(False)
+
+    def _sync_time_preset_combos(self) -> None:
+        self._set_combo_to_data(self.idle_preset_combo, self.idle_spin.value())
+        self._set_combo_to_data(self.retention_preset_combo, self.retention_spin.value())
+
+    def _apply_idle_preset(self) -> None:
+        value = int(self.idle_preset_combo.currentData())
+        if value >= 0 and self.idle_spin.value() != value:
+            self.idle_spin.setValue(value)
+        self._update_time_management_summary()
+
+    def _apply_retention_preset(self) -> None:
+        value = int(self.retention_preset_combo.currentData())
+        if value >= 0 and self.retention_spin.value() != value:
+            self.retention_spin.setValue(value)
+        self._update_time_management_summary()
+
+    def _sync_idle_preset_from_spin(self, value: int) -> None:
+        self._set_combo_to_data(self.idle_preset_combo, value)
+
+    def _sync_retention_preset_from_spin(self, value: int) -> None:
+        self._set_combo_to_data(self.retention_preset_combo, value)
+
+    def _update_time_management_summary(self) -> None:
+        idle_text = format_duration_long(float(self.idle_spin.value()))
+        retention_days = self.retention_spin.value()
+        retention_text = "永久保留" if retention_days <= 0 else f"保留最近 {retention_days} 天"
+        cleanup_text = "清理旧时间线时不会删除任何事件" if retention_days <= 0 else f"清理旧时间线会删除早于 {retention_days} 天的细节事件"
+        self.time_settings_summary.setText(
+            f"当前策略：键鼠空闲超过 {idle_text} 后暂停前台注视累计；时间线{retention_text}。"
+            f"{cleanup_text}，程序/网页/视频/音乐的日汇总仍会保留。"
+        )
 
     def add_ignored_name(self) -> None:
         name = self.ignore_input.text().strip().lower()
@@ -1659,7 +1760,10 @@ class StatsDialog(QDialog):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
-        header = QHBoxLayout()
+        header_box = QVBoxLayout()
+        header_box.setSpacing(8)
+        range_row = QHBoxLayout()
+        summary_row = QHBoxLayout()
         title = QLabel("使用数据分析")
         title.setObjectName("statsTitle")
         self.range_combo = QComboBox()
@@ -1697,6 +1801,15 @@ class StatsDialog(QDialog):
         self.detail_status.setObjectName("detailStatus")
         self.refresh_button = QPushButton("刷新")
         self.refresh_button.clicked.connect(self.refresh)
+        self.prev_range_button = QPushButton("上一段")
+        self.prev_range_button.setToolTip("按当前范围长度向前移动，例如 7 天范围会向前切换 7 天")
+        self.prev_range_button.clicked.connect(lambda: self._shift_date_range(-1))
+        self.next_range_button = QPushButton("下一段")
+        self.next_range_button.setToolTip("按当前范围长度向后移动，不会超过今天")
+        self.next_range_button.clicked.connect(lambda: self._shift_date_range(1))
+        self.today_range_button = QPushButton("今天")
+        self.today_range_button.setToolTip("回到今天")
+        self.today_range_button.clicked.connect(self._jump_to_today_range)
         report_button = QPushButton("导出报告")
         report_button.clicked.connect(self.export_report)
         music_export_button = QPushButton("导出音乐")
@@ -1705,24 +1818,33 @@ class StatsDialog(QDialog):
         learning_export_button.clicked.connect(self.export_learning_csv)
         definition_button = QPushButton("数据口径")
         definition_button.clicked.connect(self.show_data_definitions)
-        header.addWidget(title)
-        header.addWidget(self.range_combo)
-        header.addWidget(self.start_date_edit)
+        range_row.addWidget(title)
+        range_row.addWidget(self.range_combo)
+        range_row.addWidget(self.start_date_edit)
         self.date_separator_label = QLabel("至")
-        header.addWidget(self.date_separator_label)
-        header.addWidget(self.end_date_edit)
-        header.addStretch(1)
-        header.addWidget(self.learning_total)
-        header.addWidget(self.foreground_total)
-        header.addWidget(self.video_total)
-        header.addWidget(self.media_total)
-        header.addWidget(self.detail_status)
-        header.addWidget(definition_button)
-        header.addWidget(music_export_button)
-        header.addWidget(learning_export_button)
-        header.addWidget(report_button)
-        header.addWidget(self.refresh_button)
-        root.addLayout(header)
+        range_row.addWidget(self.date_separator_label)
+        range_row.addWidget(self.end_date_edit)
+        range_row.addWidget(self.prev_range_button)
+        range_row.addWidget(self.next_range_button)
+        range_row.addWidget(self.today_range_button)
+        range_row.addStretch(1)
+        range_row.addWidget(definition_button)
+        range_row.addWidget(self.refresh_button)
+        summary_row.addWidget(self.learning_total)
+        summary_row.addWidget(self.foreground_total)
+        summary_row.addWidget(self.video_total)
+        summary_row.addWidget(self.media_total)
+        summary_row.addWidget(self.detail_status, 1)
+        summary_row.addWidget(music_export_button)
+        summary_row.addWidget(learning_export_button)
+        summary_row.addWidget(report_button)
+        header_box.addLayout(range_row)
+        header_box.addLayout(summary_row)
+        root.addLayout(header_box)
+        self.range_summary_label = QLabel("当前范围：准备加载")
+        self.range_summary_label.setObjectName("rangeSummary")
+        self.range_summary_label.setWordWrap(True)
+        root.addWidget(self.range_summary_label)
         self.compare_label = QLabel("对比上一周期：准备加载")
         self.compare_label.setObjectName("compareLabel")
         self.compare_label.setWordWrap(True)
@@ -1834,6 +1956,11 @@ class StatsDialog(QDialog):
             QLabel#detailStatus {
                 color: #607089;
                 padding: 5px 8px;
+                font-size: 12px;
+            }
+            QLabel#rangeSummary {
+                color: #475569;
+                padding: 2px 4px;
                 font-size: 12px;
             }
             QLabel#compareLabel {
@@ -2253,6 +2380,42 @@ class StatsDialog(QDialog):
         self.date_separator_label.setVisible(is_custom)
         self.end_date_edit.setVisible(is_custom)
 
+    def _set_custom_date_range(self, start_date: date, end_date: date) -> None:
+        if end_date < start_date:
+            start_date, end_date = end_date, start_date
+        custom_index = self.range_combo.findData("custom")
+        self.range_combo.blockSignals(True)
+        if custom_index >= 0:
+            self.range_combo.setCurrentIndex(custom_index)
+        self.range_combo.blockSignals(False)
+        self.start_date_edit.blockSignals(True)
+        self.end_date_edit.blockSignals(True)
+        self.start_date_edit.setDate(self._date_to_qdate(start_date))
+        self.end_date_edit.setDate(self._date_to_qdate(end_date))
+        self.start_date_edit.blockSignals(False)
+        self.end_date_edit.blockSignals(False)
+        self._timeline_loaded_key = ""
+        self._sync_custom_date_controls()
+        self.refresh()
+
+    def _shift_date_range(self, direction: int) -> None:
+        start_date, end_date = self._current_date_range()
+        span_days = max(1, (end_date - start_date).days + 1)
+        new_start = start_date + timedelta(days=span_days * direction)
+        new_end = end_date + timedelta(days=span_days * direction)
+        today = date.today()
+        if direction > 0 and end_date >= today:
+            return
+        if new_end > today:
+            new_end = today
+            new_start = today - timedelta(days=span_days - 1)
+        self._set_custom_date_range(new_start, new_end)
+
+    def _jump_to_today_range(self) -> None:
+        today_index = self.range_combo.findData("today")
+        if today_index >= 0:
+            self.range_combo.setCurrentIndex(today_index)
+
     def _on_range_changed(self) -> None:
         self._timeline_loaded_key = ""
         self._custom_refresh_timer.stop()
@@ -2394,6 +2557,13 @@ class StatsDialog(QDialog):
             f"{start_date.isoformat()} ~ {end_date.isoformat()} · "
             f"程序 {len(process_rows)} · 网页 {len(web_rows)} · 视频 {len(vp_rows)} · 分类 {len(cat_rows)}"
         )
+        span_days = max(1, (end_date - start_date).days + 1)
+        self.range_summary_label.setText(
+            f"当前范围：{start_date.isoformat()} ~ {end_date.isoformat()}（{span_days} 天） · "
+            f"上一周期：{previous_start.isoformat()} ~ {previous_end.isoformat()} · "
+            "时间、导出和图表均按当前范围计算"
+        )
+        self.next_range_button.setEnabled(end_date < date.today())
         self.compare_label.setText(
             "对比上一周期 "
             f"{previous_start.isoformat()} ~ {previous_end.isoformat()}："
