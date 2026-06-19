@@ -2872,11 +2872,42 @@ class UsageWidgetWindow(QWidget):
         self.tray.show()
         self._sync_tray_actions()
 
-    def _sync_tray_actions(self) -> None:
+    def _sync_tray_actions(self, visible: bool | None = None) -> None:
+        is_visible = self.isVisible() if visible is None else visible
         if hasattr(self, "show_action"):
-            self.show_action.setText("隐藏小组件" if self.isVisible() else "显示小组件")
+            self.show_action.setText("隐藏小组件" if is_visible else "显示小组件")
         if hasattr(self, "pause_action"):
             self.pause_action.setText("恢复记录" if self.storage.load_settings().pause_tracking else "暂停记录")
+        if hasattr(self, "background_action"):
+            self.background_action.blockSignals(True)
+            self.background_action.setChecked(not is_visible)
+            self.background_action.blockSignals(False)
+
+    def _prepare_hide_to_tray(self) -> None:
+        self._hover_expand_timer.stop()
+        self._hover_collapse_timer.stop()
+        self.drag_pos = None
+        self.drag_start_pos = None
+        self.drag_moved = False
+        if not self.settings.always_expanded:
+            self.set_expanded(False)
+        self.hide()
+        self._sync_tray_actions(False)
+
+    def _show_from_tray(self) -> None:
+        self._pointer_inside = False
+        if not self.settings.always_expanded:
+            self.set_expanded(False)
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.keep_on_screen()
+        self.raise_()
+        self.activateWindow()
+        self._last_widget_refresh = 0.0
+        self.refresh()
+        self._sync_tray_actions(True)
 
     def check_daily_summary(self) -> None:
         settings = self.storage.load_settings()
@@ -3205,6 +3236,7 @@ class UsageWidgetWindow(QWidget):
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
+        self._sync_tray_actions(True)
         apply_windows_backdrop(self, is_dark_theme(self.settings))
         self._last_widget_refresh = 0.0
         self._footer_cache_at = 0.0
@@ -3214,19 +3246,14 @@ class UsageWidgetWindow(QWidget):
             self._summary_checked_today = True
             QTimer.singleShot(800, self.check_daily_summary)
 
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        super().hideEvent(event)
+        self._sync_tray_actions(False)
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        self._position_save_timer.stop()
-        self._hover_expand_timer.stop()
-        self._hover_collapse_timer.stop()
-        self.drag_pos = None
-        self.drag_start_pos = None
-        self.drag_moved = False
-        if not self.settings.always_expanded:
-            self.set_expanded(False)
         self.save_position()
         event.ignore()
-        self.hide()
-        self.show_action.setText("显示小组件")
+        self._prepare_hide_to_tray()
 
     def moveEvent(self, event) -> None:  # type: ignore[override]
         super().moveEvent(event)
@@ -3692,37 +3719,16 @@ class UsageWidgetWindow(QWidget):
             row_widget.show()
 
     def toggle_visible(self) -> None:
-        if self.isVisible():
-            self._hover_expand_timer.stop()
-            self._hover_collapse_timer.stop()
-            self.drag_pos = None
-            self.drag_start_pos = None
-            self.drag_moved = False
-            if not self.settings.always_expanded:
-                self.set_expanded(False)
-            self.hide()
-            self._sync_tray_actions()
+        if self.isVisible() and not self.isMinimized():
+            self._prepare_hide_to_tray()
         else:
-            self._pointer_inside = False
-            if not self.settings.always_expanded:
-                self.set_expanded(False)
-            self.show()
-            self.keep_on_screen()
-            self.raise_()
-            self.activateWindow()
-            self._sync_tray_actions()
+            self._show_from_tray()
 
     def toggle_background_mode(self) -> None:
         if self.background_action.isChecked():
-            self._hover_expand_timer.stop()
-            self._hover_collapse_timer.stop()
-            self.hide()
-            self.show_action.setText("显示小组件")
+            self._prepare_hide_to_tray()
         else:
-            self.show()
-            self.keep_on_screen()
-            self.show_action.setText("隐藏小组件")
-        self._sync_tray_actions()
+            self._show_from_tray()
 
     def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
