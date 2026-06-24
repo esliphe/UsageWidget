@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+from .classification import clean_lookup_title
+
 
 @dataclass(frozen=True)
 class BrowserTab:
@@ -136,10 +138,14 @@ class BrowserBridge:
 
     def _tab_from_payload(self, payload: dict, title: str, url: str, browser: str, audible: bool) -> BrowserTab:
         signal = self._signal_for_url(url)
+        domain = domain_from_url(url)
+        signal_title = clean_lookup_title(domain, signal.title if signal else "")
+        payload_title = clean_lookup_title(domain, title)
+        display_title = signal_title or payload_title or title or (signal.title if signal else "")
         return BrowserTab(
-            title=title or (signal.title if signal else ""),
+            title=display_title,
             url=url,
-            domain=domain_from_url(url),
+            domain=domain,
             browser=browser,
             received_at=time.monotonic(),
             audible=audible,

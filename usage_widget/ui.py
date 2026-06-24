@@ -2442,8 +2442,7 @@ class StatsDialog(QDialog):
         return self.tabs.currentWidget() is self.timeline_tab
 
     def _on_tab_changed(self, _index: int) -> None:
-        if self._is_timeline_tab_active() and self._timeline_loaded_key != self._date_range_key():
-            QTimer.singleShot(0, self.refresh)
+        QTimer.singleShot(0, self.refresh)
 
     def _load_more_timeline(self) -> None:
         self._timeline_limit = min(self._timeline_limit + 200, 2000)
@@ -2520,32 +2519,42 @@ class StatsDialog(QDialog):
 
     def _do_refresh(self) -> None:
         start_date, end_date = self._current_date_range()
+        active_widget = self.tabs.currentWidget()
+        active_overview = active_widget is self.overview_tab
+        active_programs = active_widget is self.programs_tab
         active_timeline = self._is_timeline_tab_active()
+        active_web = active_widget is self.web_tab
+        active_video = active_widget is self.video_tab
+        active_music = active_widget is self.music_tab
+        active_learning = active_widget is self.learning_analysis_tab
+        active_category = active_widget is self.category_table
+        active_goal = active_widget is self.goal_table
         previous_start, previous_end = self._previous_date_range(start_date, end_date)
         # ---- All queries (synchronous, fast with indexes) ----
         foreground = self.storage.foreground_total_range(start_date, end_date)
         media = self.storage.media_total_range(start_date, end_date)
         video = self.storage.video_total_range(start_date, end_date)
         learning_total = self.storage.learning_total_range(start_date, end_date)
+        overview_counts = self.storage.overview_counts_range(start_date, end_date)
         prev_foreground = self.storage.foreground_total_range(previous_start, previous_end)
         prev_media = self.storage.media_total_range(previous_start, previous_end)
         prev_video = self.storage.video_total_range(previous_start, previous_end)
         prev_learning = self.storage.learning_total_range(previous_start, previous_end)
-        learning_topics_count = len(self.storage.learning_topic_summary_range(start_date, end_date, limit=100))
-        process_rows = list(self.storage.process_rows_range(start_date, end_date, limit=120))
-        web_rows = list(self.storage.content_rows_range(start_date, end_date, kind="web_page", limit=200))
-        vp_rows = list(self.storage.content_rows_range(start_date, end_date, kind="video_playback", limit=200))
-        mp_rows = list(self.storage.music_playback_rows_range(start_date, end_date, limit=200))
-        win_rows = list(self.storage.content_rows_range(start_date, end_date, kind="window_title", limit=200))
-        cat_rows = list(self.storage.category_summary_range(start_date, end_date))
-        hourly_rows = self.storage.hourly_activity_range(start_date, end_date)
+        learning_topics_count = int(overview_counts["learning_topic_count"])
+        process_rows = list(self.storage.process_rows_range(start_date, end_date, limit=120)) if active_programs else []
+        web_rows = list(self.storage.content_rows_range(start_date, end_date, kind="web_page", limit=200)) if active_web else []
+        vp_rows = list(self.storage.content_rows_range(start_date, end_date, kind="video_playback", limit=200)) if active_video else []
+        mp_rows = list(self.storage.music_playback_rows_range(start_date, end_date, limit=200)) if active_music else []
+        win_rows = list(self.storage.content_rows_range(start_date, end_date, kind="window_title", limit=200)) if active_programs else []
+        cat_rows = list(self.storage.category_summary_range(start_date, end_date)) if active_overview or active_category else []
+        hourly_rows = self.storage.hourly_activity_range(start_date, end_date) if active_overview else []
         tl_rows = list(self.storage.timeline_rows_range(start_date, end_date, limit=self._timeline_limit)) if active_timeline else []
-        domain_rows = list(self.storage.domain_summary_range(start_date, end_date, limit=100))
-        vd_rows = list(self.storage.video_domain_summary_range(start_date, end_date, limit=100))
-        music_analysis = self.storage.music_analysis_range(start_date, end_date, limit=200)
-        artist_data = self.storage.artist_summary_range(start_date, end_date, limit=80)
-        learning_data = self.storage.learning_topic_summary_range(start_date, end_date, limit=200)
-        goal_progress = self.storage.goal_progress_range(start_date, end_date)
+        domain_rows = list(self.storage.domain_summary_range(start_date, end_date, limit=100)) if active_web else []
+        vd_rows = list(self.storage.video_domain_summary_range(start_date, end_date, limit=100)) if active_video else []
+        music_analysis = self.storage.music_analysis_range(start_date, end_date, limit=200) if active_music else []
+        artist_data = self.storage.artist_summary_range(start_date, end_date, limit=80) if active_music else []
+        learning_data = self.storage.learning_topic_summary_range(start_date, end_date, limit=200) if active_learning else []
+        goal_progress = self.storage.goal_progress_range(start_date, end_date) if active_goal else []
         goal_streaks = {str(g["goal"]["name"]): self.storage.goal_streak(str(g["goal"]["name"])) for g in goal_progress}
 
         # ---- Top totals ----
@@ -2555,7 +2564,10 @@ class StatsDialog(QDialog):
         self.learning_total.setText(f"学习 {format_duration(learning_total)}")
         self.detail_status.setText(
             f"{start_date.isoformat()} ~ {end_date.isoformat()} · "
-            f"程序 {len(process_rows)} · 网页 {len(web_rows)} · 视频 {len(vp_rows)} · 分类 {len(cat_rows)}"
+            f"程序 {int(overview_counts['program_count'])} · "
+            f"网页 {int(overview_counts['web_count'])} · "
+            f"视频 {int(overview_counts['video_count'])} · "
+            f"分类 {int(overview_counts['category_count'])}"
         )
         span_days = max(1, (end_date - start_date).days + 1)
         self.range_summary_label.setText(
@@ -2574,154 +2586,165 @@ class StatsDialog(QDialog):
         )
 
         # ---- Overview cards ----
-        web_total = sum(float(r["attention_seconds"] or 0) for r in web_rows)
-        web_domains = len({str(r["content_domain"]) for r in web_rows if str(r["content_domain"]).strip()})
-        self.focus_card.set_data(foreground, f"{len(process_rows)} programs")
+        web_total = float(overview_counts["web_attention"])
+        web_domains = int(overview_counts["web_domain_count"])
+        self.focus_card.set_data(foreground, f"{int(overview_counts['program_count'])} programs")
         self.web_card.set_data(web_total, f"{web_domains} domains")
-        self.video_card.set_data(video, f"{len(vp_rows)} videos")
-        self.music_card.set_data(media, f"{len(mp_rows)} tracks")
+        self.video_card.set_data(video, f"{int(overview_counts['video_count'])} videos")
+        self.music_card.set_data(media, f"{int(overview_counts['music_count'])} tracks")
         self.learning_today_card.set_data(learning_total, f"{learning_topics_count} topics")
 
         # ---- Charts ----
-        try:
-            self.category_chart.set_data([
-                (str(r["category"]), float(r["attention_seconds"] or 0), float(r["background_seconds"] or 0))
-                for r in cat_rows
-            ])
-        except Exception:
-            pass
-        try:
-            self.hourly_chart.set_data(hourly_rows)
-        except Exception:
-            pass
+        if active_overview:
+            try:
+                self.category_chart.set_data([
+                    (str(r["category"]), float(r["attention_seconds"] or 0), float(r["background_seconds"] or 0))
+                    for r in cat_rows
+                ])
+            except Exception:
+                pass
+            try:
+                self.hourly_chart.set_data(hourly_rows)
+            except Exception:
+                pass
 
         # ---- Tables ----
-        self._set_rows(self.process_table, [[
-            str(r["exe_name"]),
-            self._duration_cell(float(r["foreground_seconds"] or 0)),
-            self._duration_cell(float(r["running_seconds"] or 0)),
-            self._duration_cell(max(0.0, float(r["running_seconds"] or 0) - float(r["foreground_seconds"] or 0))),
-            str(r["exe_path"]),
-        ] for r in process_rows])
+        if active_programs:
+            self._set_rows(self.process_table, [[
+                str(r["exe_name"]),
+                self._duration_cell(float(r["foreground_seconds"] or 0)),
+                self._duration_cell(float(r["running_seconds"] or 0)),
+                self._duration_cell(max(0.0, float(r["running_seconds"] or 0) - float(r["foreground_seconds"] or 0))),
+                str(r["exe_path"]),
+            ] for r in process_rows])
 
-        self._set_rows(self.web_table, [[
-            str(r["content_title"]), str(r["content_domain"]), str(r["category"]),
-            str(r["learning_topic"] or "-"),
-            str(r["exe_name"]), self._duration_cell(float(r["attention_seconds"] or 0)),
-            str(r["content_url"]),
-        ] for r in web_rows])
+            self._set_rows(self.window_table, [[
+                str(r["content_title"]), str(r["category"]), str(r["learning_topic"] or "-"), str(r["exe_name"]),
+                self._duration_cell(float(r["attention_seconds"] or 0)), str(r["last_seen"]),
+            ] for r in win_rows])
 
-        self._set_rows(self.video_table, [[
-            str(r["content_title"]), str(r["content_domain"]), str(r["category"]),
-            str(r["learning_topic"] or "-"),
-            self._duration_cell(float(r["background_seconds"] or 0)), str(r["content_url"]),
-        ] for r in vp_rows])
+        if active_web:
+            self._set_rows(self.web_table, [[
+                str(r["content_title"]), str(r["content_domain"]), str(r["category"]),
+                str(r["learning_topic"] or "-"),
+                str(r["exe_name"]), self._duration_cell(float(r["attention_seconds"] or 0)),
+                str(r["content_url"]),
+            ] for r in web_rows])
 
-        self._set_rows(self.media_table, [[
-            str(r["content_title"]), str(r["category"]), str(r["exe_name"]),
-            self._duration_cell(float(r["background_seconds"] or 0)), str(r["last_seen"]),
-        ] for r in mp_rows])
+        if active_video:
+            self._set_rows(self.video_table, [[
+                str(r["content_title"]), str(r["content_domain"]), str(r["category"]),
+                str(r["learning_topic"] or "-"),
+                self._duration_cell(float(r["background_seconds"] or 0)), str(r["content_url"]),
+            ] for r in vp_rows])
 
-        self._set_rows(self.window_table, [[
-            str(r["content_title"]), str(r["category"]), str(r["learning_topic"] or "-"), str(r["exe_name"]),
-            self._duration_cell(float(r["attention_seconds"] or 0)), str(r["last_seen"]),
-        ] for r in win_rows])
+        if active_music:
+            self._set_rows(self.media_table, [[
+                str(r["content_title"]), str(r["category"]), str(r["exe_name"]),
+                self._duration_cell(float(r["background_seconds"] or 0)), str(r["last_seen"]),
+            ] for r in mp_rows])
 
-        category_total = sum(float(r["total_seconds"] or 0) for r in cat_rows)
-        self._set_rows(self.category_table, [[
-            str(r["category"]),
-            self._duration_cell(float(r["total_seconds"] or 0)),
-            (f"{(float(r['total_seconds'] or 0) / category_total * 100):.1f}%" if category_total > 0 else "0.0%", float(r["total_seconds"] or 0)),
-            self._duration_cell(float(r["attention_seconds"] or 0)),
-            self._duration_cell(float(r["background_seconds"] or 0)),
-            str(r["item_count"]),
-            self._kind_label(str(r["kinds"] or "")),
-            str(r["last_seen"] or ""),
-        ] for r in cat_rows])
+        if active_category:
+            category_total = sum(float(r["total_seconds"] or 0) for r in cat_rows)
+            self._set_rows(self.category_table, [[
+                str(r["category"]),
+                self._duration_cell(float(r["total_seconds"] or 0)),
+                (f"{(float(r['total_seconds'] or 0) / category_total * 100):.1f}%" if category_total > 0 else "0.0%", float(r["total_seconds"] or 0)),
+                self._duration_cell(float(r["attention_seconds"] or 0)),
+                self._duration_cell(float(r["background_seconds"] or 0)),
+                str(r["item_count"]),
+                self._kind_label(str(r["kinds"] or "")),
+                str(r["last_seen"] or ""),
+            ] for r in cat_rows])
 
         # ---- Domain tables ----
-        self._set_rows(self.domain_table, [[
-            str(r["content_domain"]).replace("（无域名 - 需安装浏览器扩展）|", ""),
-            self._duration_cell(float(r["attention_seconds"] or 0)),
-            str(r["page_count"]),
-            " / ".join((str(r["top_titles"] or "").split(","))[:3]) or "-",
-            str(r["last_seen"]),
-        ] for r in domain_rows])
+        if active_web:
+            self._set_rows(self.domain_table, [[
+                str(r["content_domain"]).replace("（无域名 - 需安装浏览器扩展）|", ""),
+                self._duration_cell(float(r["attention_seconds"] or 0)),
+                str(r["page_count"]),
+                " / ".join((str(r["top_titles"] or "").split(","))[:3]) or "-",
+                str(r["last_seen"]),
+            ] for r in domain_rows])
 
-        self._set_rows(self.video_domain_table, [[
-            str(r["content_domain"]).replace("（无域名 - 需安装浏览器扩展）|", ""),
-            self._duration_cell(float(r["total_seconds"] or 0)),
-            str(r["video_count"]),
-            " / ".join((str(r["top_titles"] or "").split(","))[:3]) or "-",
-            str(r["category"]), str(r["last_seen"]),
-        ] for r in vd_rows])
+        if active_video:
+            self._set_rows(self.video_domain_table, [[
+                str(r["content_domain"]).replace("（无域名 - 需安装浏览器扩展）|", ""),
+                self._duration_cell(float(r["total_seconds"] or 0)),
+                str(r["video_count"]),
+                " / ".join((str(r["top_titles"] or "").split(","))[:3]) or "-",
+                str(r["category"]), str(r["last_seen"]),
+            ] for r in vd_rows])
 
         # ---- Music analysis ----
-        ma_rows = [[
-            str(r["song"]), str(r["artist"]),
-            " / ".join(str(s) for s in r["sources"])[:80],
-            self._duration_cell(float(r["seconds"])),
-            (f"{float(r['percent']):.1f}%", float(r["percent"])),
-            str(r["last_seen"]),
-        ] for r in music_analysis]
-        self._set_rows(self.music_analysis_table, ma_rows)
-        self.music_analysis_total.set_data(media, f"{len(mp_rows)} tracks")
-        self.music_analysis_count.set_data(str(len(ma_rows)), "by song+artist")
-        if ma_rows:
-            self.music_analysis_top.set_data(str(ma_rows[0][0])[:18], str(ma_rows[0][1])[:24])
+        if active_music:
+            ma_rows = [[
+                str(r["song"]), str(r["artist"]),
+                " / ".join(str(s) for s in r["sources"])[:80],
+                self._duration_cell(float(r["seconds"])),
+                (f"{float(r['percent']):.1f}%", float(r["percent"])),
+                str(r["last_seen"]),
+            ] for r in music_analysis]
+            self._set_rows(self.music_analysis_table, ma_rows)
+            self.music_analysis_total.set_data(media, f"{int(overview_counts['music_count'])} tracks")
+            self.music_analysis_count.set_data(str(len(ma_rows)), "by song+artist")
+            if ma_rows:
+                self.music_analysis_top.set_data(str(ma_rows[0][0])[:18], str(ma_rows[0][1])[:24])
 
-        # ---- Artist analysis ----
-        ar_rows = [[
-            str(r["artist"]), self._duration_cell(float(r["seconds"])),
-            str(r["song_count"]), str(r["top_songs"])[:60],
-            str(r["sources"])[:60], (f"{float(r['percent']):.1f}%", float(r["percent"])),
-        ] for r in artist_data]
-        self._set_rows(self.artist_analysis_table, ar_rows)
+            # ---- Artist analysis ----
+            ar_rows = [[
+                str(r["artist"]), self._duration_cell(float(r["seconds"])),
+                str(r["song_count"]), str(r["top_songs"])[:60],
+                str(r["sources"])[:60], (f"{float(r['percent']):.1f}%", float(r["percent"])),
+            ] for r in artist_data]
+            self._set_rows(self.artist_analysis_table, ar_rows)
 
         # ---- Learning analysis ----
-        lr_rows = [[
-            str(r["learning_topic"]),
-            self._duration_cell(float(r["attention_seconds"] or 0)),
-            self._duration_cell(float(r["background_seconds"] or 0)),
-            self._duration_cell(float(r["total_seconds"] or 0)),
-            str(r["item_count"]), str(r["last_seen"]),
-        ] for r in learning_data]
-        self._set_rows(self.learning_analysis_table, lr_rows)
-        self.learning_analysis_total.set_data(learning_total, f"{len(learning_data)} topics")
+        if active_learning:
+            lr_rows = [[
+                str(r["learning_topic"]),
+                self._duration_cell(float(r["attention_seconds"] or 0)),
+                self._duration_cell(float(r["background_seconds"] or 0)),
+                self._duration_cell(float(r["total_seconds"] or 0)),
+                str(r["item_count"]), str(r["last_seen"]),
+            ] for r in learning_data]
+            self._set_rows(self.learning_analysis_table, lr_rows)
+            self.learning_analysis_total.set_data(learning_total, f"{len(learning_data)} topics")
 
         # ---- Goals ----
-        goal_rows = []
-        goal_colors = []
-        streak_parts = []
-        for item in goal_progress:
-            g = item["goal"]
-            val, target = float(item["value"]), float(item["target"])
-            ok = bool(item["ok"])
-            ratio = val / target if target > 0 else 0
-            if ok:
-                st, color = "达标", "#55b88d"
-            elif ratio >= 0.7:
-                st, color = "接近", "#f0a33a"
+        if active_goal:
+            goal_rows = []
+            goal_colors = []
+            streak_parts = []
+            for item in goal_progress:
+                g = item["goal"]
+                val, target = float(item["value"]), float(item["target"])
+                ok = bool(item["ok"])
+                ratio = val / target if target > 0 else 0
+                if ok:
+                    st, color = "达标", "#55b88d"
+                elif ratio >= 0.7:
+                    st, color = "接近", "#f0a33a"
+                else:
+                    st, color = "未达标", "#d95f76"
+                goal_rows.append([
+                    str(g["name"]), "at least" if g["direction"] == "min" else "max",
+                    self._duration_cell(val), self._duration_cell(target), st,
+                ])
+                goal_colors.append(color)
+                streak = goal_streaks.get(str(g["name"]), 0)
+                if streak > 0:
+                    streak_parts.append(f"{g['name']} {streak}d")
+            self._set_rows(self.goal_table, goal_rows)
+            for i, c in enumerate(goal_colors):
+                item = self.goal_table.item(i, 4)
+                if item:
+                    item.setForeground(QColor(c))
+            if streak_parts:
+                self.streak_label.setText(" + ".join(streak_parts))
+                self.streak_label.setVisible(True)
             else:
-                st, color = "未达标", "#d95f76"
-            goal_rows.append([
-                str(g["name"]), "at least" if g["direction"] == "min" else "max",
-                self._duration_cell(val), self._duration_cell(target), st,
-            ])
-            goal_colors.append(color)
-            streak = goal_streaks.get(str(g["name"]), 0)
-            if streak > 0:
-                streak_parts.append(f"{g['name']} {streak}d")
-        self._set_rows(self.goal_table, goal_rows)
-        for i, c in enumerate(goal_colors):
-            item = self.goal_table.item(i, 4)
-            if item:
-                item.setForeground(QColor(c))
-        if streak_parts:
-            self.streak_label.setText(" + ".join(streak_parts))
-            self.streak_label.setVisible(True)
-        else:
-            self.streak_label.setVisible(False)
+                self.streak_label.setVisible(False)
 
         # ---- Timeline: lazy-loaded because large event tables can freeze QTableWidget.
         if active_timeline:

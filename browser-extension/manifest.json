@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "UsageWidget URL Bridge",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Send active tab, page signals, and audible media state to the local UsageWidget desktop app.",
   "permissions": ["tabs", "activeTab"],
   "host_permissions": ["http://127.0.0.1:47621/*"],

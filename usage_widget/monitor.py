@@ -9,6 +9,12 @@ import psutil
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from .browser_bridge import BrowserBridge
+from .classification import (
+    BROAD_PLATFORM_CATEGORIES,
+    clean_lookup_title,
+    is_generic_content_domain,
+    normalize_lookup_text,
+)
 from .content import classify_window_content, extract_onenote_info
 from .diagnostics import log_event
 from .idle import idle_seconds
@@ -165,6 +171,79 @@ class ProcessMonitor(QObject):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.sample)
 
+    def _is_generic_browser_process(self, exe_name: str) -> bool:
+        exe = (exe_name or "").casefold()
+        if not exe:
+            return False
+        return exe in MEDIA_BROWSER_HINTS or any(hint in exe for hint in MEDIA_BROWSER_HINTS)
+
+    def _is_generic_content_domain(self, domain: str) -> bool:
+        return is_generic_content_domain(domain)
+
+    def _should_remember_domain_rule(self, domain: str, category: str) -> bool:
+        domain_l = (domain or "").casefold()
+        if not domain_l or self._is_generic_content_domain(domain_l):
+            return False
+        category_hints = {
+            "编程": ("docs.", "developer", "dev.", "api.", "sdk", "github", "gitlab", "code", "stackoverflow"),
+            "学习": ("learn", "course", "edu", "academy", "university", "school", "wiki", "scholar", "research", "arxiv", "paper", "docs."),
+            "音乐": ("music", "spotify", "soundcloud", "podcast"),
+            "购物": ("shop", "store", "mall", "market"),
+            "新闻": ("news", "daily", "paper"),
+            "聊天": ("chat", "message", "messenger", "telegram", "discord", "slack"),
+            "AI 工具": ("ai", "gpt", "llm", "openai", "claude", "gemini", "deepseek", "kimi", "doubao", "yuanbao"),
+        }
+        hints = category_hints.get(category, ())
+        return any(hint in domain_l for hint in hints)
+
+    def _refine_generic_content_category(self, category: str, exe_name: str, domain: str, title: str) -> str:
+        if not self._is_generic_content_domain(domain):
+            return category
+        if category not in BROAD_PLATFORM_CATEGORIES:
+            return category
+        local = self._fallback_category_for(exe_name, "", clean_lookup_title(domain, title))
+        if local in {"其他", "工具", "浏览器", "网站"}:
+            return category
+        if local == "视频" and category != "网站":
+            return category
+        return local
+
+    def _should_refine_generic_content_online(self, category: str, domain: str, title: str, settings) -> bool:
+        if not settings.online_category_lookup or settings.private_title_mode:
+            return False
+        if category not in BROAD_PLATFORM_CATEGORIES:
+            return False
+        if not self._is_generic_content_domain(domain):
+            return False
+        return len(normalize_lookup_text(domain, clean_lookup_title(domain, title))) >= 8
+
+    def _remember_online_category_rule(
+        self,
+        exe_name: str,
+        domain: str,
+        title: str,
+        category: str,
+    ) -> None:
+        if not category or category == "其他":
+            return
+        domain_l = (domain or "").casefold().strip()
+        exe_l = (exe_name or "").casefold().strip()
+        title_l = clean_lookup_title(domain_l, title).casefold().strip()
+        if self._should_remember_domain_rule(domain_l, category):
+            self.storage.add_category_rule(domain_l, category, "domain", update_existing=False)
+            return
+        if self._is_generic_content_domain(domain_l):
+            if title_l and len(title_l) >= 8 and category not in BROAD_PLATFORM_CATEGORIES:
+                self.storage.add_category_rule(title_l[:120], category, "title", update_existing=False)
+            return
+        if self._is_generic_browser_process(exe_l):
+            return
+        if exe_l and len(exe_l) >= 3:
+            self.storage.add_category_rule(exe_l, category, "app", update_existing=False)
+            return
+        if title_l and len(title_l) >= 8:
+            self.storage.add_category_rule(title_l[:80], category, "title", update_existing=False)
+
     def _is_handwriting_context(self, settings, proc: RunningProcess | None, title: str) -> bool:
         if not settings.handwriting_mode or not proc:
             return False
@@ -212,22 +291,31 @@ class ProcessMonitor(QObject):
         return False
 
     def _category_for(self, exe_name: str, domain: str, title: str, settings) -> str:
-        category = self.storage.category_for(exe_name, domain, title)
+        clean_title = clean_lookup_title(domain, title)
+        category = self.storage.category_for(exe_name, domain, clean_title)
         if category != "其他":
-            return category
+            refined_category = self._refine_generic_content_category(category, exe_name, domain, clean_title)
+            if self._should_refine_generic_content_online(category, domain, clean_title, settings):
+                result = self.category_classifier.cached(exe_name, domain, clean_title)
+                if result:
+                    if result.category != "其他" and result.confidence >= 0.55:
+                        self._remember_online_category_rule(exe_name, domain, clean_title, result.category)
+                        if result.category not in {"视频", "网站", "浏览器"}:
+                            return result.category
+                elif len(normalize_text(exe_name, domain, clean_title)) >= 3:
+                    self.category_classifier.queue(exe_name, domain, clean_title)
+            return refined_category
         if not settings.online_category_lookup or settings.private_title_mode:
-            return self._fallback_category_for(exe_name, domain, title)
-        result = self.category_classifier.cached(exe_name, domain, title)
+            return self._fallback_category_for(exe_name, domain, clean_title)
+        result = self.category_classifier.cached(exe_name, domain, clean_title)
         if result:
             if result.category != "其他" and result.confidence >= 0.55:
-                self.storage.add_category_rule(
-                    exe_name.lower(), result.category, "app", update_existing=False
-                )
+                self._remember_online_category_rule(exe_name, domain, clean_title, result.category)
                 return result.category
         else:
-            if exe_name and len(exe_name) >= 3:
-                self.category_classifier.queue(exe_name, domain, title)
-        return self._fallback_category_for(exe_name, domain, title)
+            if len(normalize_text(exe_name, domain, clean_title)) >= 3:
+                self.category_classifier.queue(exe_name, domain, clean_title)
+        return self._fallback_category_for(exe_name, domain, clean_title)
 
     def _learning_topic_for(
         self,
@@ -257,7 +345,8 @@ class ProcessMonitor(QObject):
     ) -> str:
         if settings.private_title_mode:
             return ""
-        text = normalize_text(title, description)
+        clean_title = clean_lookup_title(domain, title)
+        text = normalize_text(clean_title, description)
         local = local_learning_topic(text)
         if local.topic and should_mark_learning(category, local.topic, domain, text, kind):
             return local.topic
@@ -295,12 +384,8 @@ class ProcessMonitor(QObject):
     def _fallback_category_for(self, exe_name: str, domain: str = "", title: str = "") -> str:
         exe = (exe_name or "").casefold()
         domain_l = (domain or "").casefold()
-        title_l = (title or "").casefold()
+        title_l = clean_lookup_title(domain_l, title).casefold()
         text = f"{exe} {domain_l} {title_l}"
-
-        # Check learning intent first for video/audio content without domain info
-        if has_learning_intent(domain_l, title_l):
-            return "学习"
 
         if "applicationframehost.exe" in exe and "onenote" in title_l:
             return "学习"
@@ -422,37 +507,68 @@ class ProcessMonitor(QObject):
         if any(item in text for item in ai_hints):
             return "AI 工具"
 
+        music_hints = ("music", "spotify", "kugou", "kuwo", "cloudmusic", "song", "album", "音乐", "歌曲", "歌单", "专辑")
+        if any(item in text for item in music_hints) and not has_learning_intent(domain_l, title_l):
+            return "音乐"
+
+        game_hints = (
+            "game", "steam", "epicgames", "riot", "minecraft", "roblox", "genshin",
+            "游戏", "攻略", "原神", "英雄联盟", "王者荣耀", "崩坏", "星穹铁道",
+            "实况", "试玩", "通关", "抽卡", "boss战", "游戏解说", "gameplay",
+        )
+        if any(item in text for item in game_hints):
+            if not has_learning_intent(domain_l, title_l) or any(item in text for item in ("实况", "娱乐", "直播", "攻略", "gameplay")):
+                return "游戏"
+
+        entertainment_hints = (
+            "douyin", "tiktok", "kuaishou", "xiaohongshu", "weibo", "reddit",
+            "funny", "娱乐", "搞笑", "搞笑合集", "笑到", "整活", "鬼畜", "沙雕",
+            "短视频", "热搜", "吐槽", "reaction", "vlog", "日常", "生活",
+            "综艺", "番剧", "动漫", "动画", "二创", "影视解说", "名场面",
+        )
+        if any(item in text for item in entertainment_hints) and not has_learning_intent(domain_l, title_l):
+            return "娱乐"
+
         learning_hints = (
             "course", "lecture", "lesson", "learn", "edu", "university", "wikipedia", "zhihu",
             "教程", "课程", "学习", "讲解", "论文", "考试", "期末", "期中", "不挂科",
             "突击", "速成", "冲刺", "备考", "考点", "蜂考", "大学物理", "光学",
+            "知识", "科普", "详解", "入门", "公开课",
+            "法律", "法学", "刑法", "民法", "法考", "司法考试", "罗翔",
         )
         if any(item in text for item in learning_hints):
             return "学习"
+        if has_learning_intent(domain_l, title_l):
+            return "学习"
 
-        music_hints = ("music", "spotify", "kugou", "kuwo", "cloudmusic", "song", "album", "音乐", "歌曲", "歌单", "专辑")
         if any(item in text for item in music_hints):
             return "音乐"
 
-        game_hints = ("game", "steam", "epicgames", "riot", "minecraft", "roblox", "genshin", "游戏", "攻略", "原神", "英雄联盟")
         if any(item in text for item in game_hints):
             return "游戏"
 
-        video_hints = ("youtube", "bilibili", "youku", "iqiyi", "video", "movie", "tv", "直播", "视频", "电影", "电视剧")
-        if any(item in text for item in video_hints):
-            return "视频"
-
-        shopping_hints = ("shop", "store", "taobao", "tmall", "jd.com", "amazon", "购物", "商城", "电商")
+        shopping_hints = (
+            "shop", "store", "taobao", "tmall", "jd.com", "amazon", "购物",
+            "商城", "电商", "开箱", "测评", "评测", "好物", "优惠", "省钱",
+            "618", "双十一", "值得买",
+        )
         if any(item in text for item in shopping_hints):
             return "购物"
 
-        entertainment_hints = ("douyin", "tiktok", "kuaishou", "xiaohongshu", "weibo", "reddit", "funny", "娱乐", "搞笑", "短视频", "热搜")
+        news_hints = ("news", "headline", "breaking", "新闻", "资讯", "热点", "时事", "国际", "财经新闻", "日报")
+        if any(item in text for item in news_hints):
+            return "新闻"
+
         if any(item in text for item in entertainment_hints):
             return "娱乐"
 
         office_hints = ("office", "word", "excel", "powerpoint", "onenote", "notion", "lark", "feishu", "dingtalk", "teams", "办公", "文档", "笔记", "会议")
         if any(item in text for item in office_hints):
             return "办公"
+
+        video_hints = ("youtube", "bilibili", "b23.tv", "youku", "iqiyi", "video", "movie", "tv", "直播", "视频", "电影", "电视剧")
+        if any(item in text for item in video_hints):
+            return "视频"
 
         if exe in MEDIA_BROWSER_HINTS or any(browser in exe for browser in MEDIA_BROWSER_HINTS):
             return "网站" if domain_l else "浏览器"

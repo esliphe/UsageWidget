@@ -10,6 +10,12 @@ import html as html_lib
 from dataclasses import dataclass
 
 from . import __version__
+from .classification import (
+    BROAD_PLATFORM_CATEGORIES,
+    clean_lookup_title,
+    is_generic_content_domain,
+    normalize_lookup_text,
+)
 
 
 USER_AGENT = f"UsageWidget/{__version__}"
@@ -59,6 +65,9 @@ class OnlineCategoryClassifier:
             "学习",
             "教学",
             "教程",
+            "知识",
+            "科普",
+            "详解",
             "讲义",
             "考试",
             "期末",
@@ -82,6 +91,16 @@ class OnlineCategoryClassifier:
             "textbook",
             "paper",
             "research",
+            "law",
+            "legal",
+            "jurisprudence",
+            "法律",
+            "法学",
+            "刑法",
+            "民法",
+            "法考",
+            "司法考试",
+            "罗翔",
         },
         "编程": {
             "programming",
@@ -266,6 +285,11 @@ class OnlineCategoryClassifier:
             "genshin",
             "游戏",
             "攻略",
+            "实况",
+            "试玩",
+            "通关",
+            "抽卡",
+            "游戏解说",
             "电竞",
             "原神",
             "崩坏",
@@ -349,10 +373,25 @@ class OnlineCategoryClassifier:
             "reddit",
             "娱乐",
             "搞笑",
+            "搞笑合集",
+            "笑到",
+            "整活",
+            "鬼畜",
+            "沙雕",
             "短视频",
             "综艺",
             "热搜",
             "小红书",
+            "吐槽",
+            "reaction",
+            "vlog",
+            "日常",
+            "生活",
+            "影视解说",
+            "番剧",
+            "动漫",
+            "动画",
+            "二创",
         },
         "新闻": {
             "news",
@@ -362,6 +401,10 @@ class OnlineCategoryClassifier:
             "新闻",
             "资讯",
             "日报",
+            "热点",
+            "时事",
+            "国际新闻",
+            "财经新闻",
         },
         "购物": {
             "shopping",
@@ -374,6 +417,11 @@ class OnlineCategoryClassifier:
             "购物",
             "商城",
             "电商",
+            "开箱",
+            "测评",
+            "评测",
+            "好物",
+            "优惠",
         },
         "办公": {
             "productivity",
@@ -464,13 +512,12 @@ class OnlineCategoryClassifier:
 
     def _worker(self, key: str, exe_name: str, domain: str, title: str) -> None:
         try:
-            now = time.monotonic()
             with self._lock:
+                now = time.monotonic()
                 wait = max(0.0, self.min_interval - (now - self._last_request_at))
+                self._last_request_at = now + wait
             if wait:
                 time.sleep(wait)
-            with self._lock:
-                self._last_request_at = time.monotonic()
             result = self._lookup(exe_name, domain, title)
             with self._lock:
                 self._cache[key] = (time.monotonic(), result)
@@ -487,13 +534,24 @@ class OnlineCategoryClassifier:
                 self._active_workers -= 1
 
     def _lookup(self, exe_name: str, domain: str, title: str) -> CategoryLookupResult:
-        query = self._query(exe_name, domain, title)
+        title_for_lookup = clean_lookup_title(domain, title)
+        query = self._query(exe_name, domain, title_for_lookup)
         self.last_query = query
         if not query:
             return CategoryLookupResult("其他", 0.0, "empty")
 
         category, confidence = self._classify_text(query)
-        if category != "其他" and confidence >= 0.62:
+        title_category, title_confidence = self._classify_text(title_for_lookup)
+        if (
+            title_category != "其他"
+            and title_confidence >= 0.62
+            and (
+                not self._is_generic_content_domain(domain)
+                or title_category not in {"视频", "网站"}
+            )
+        ):
+            return CategoryLookupResult(title_category, title_confidence, "local-title", title_for_lookup[:260])
+        if category != "其他" and confidence >= 0.62 and not self._is_broad_platform_bucket(domain, category):
             return CategoryLookupResult(category, confidence, "local-query", query[:260])
 
         providers = []
@@ -502,6 +560,7 @@ class OnlineCategoryClassifier:
         providers.extend(
             [
                 lambda: self._lookup_duckduckgo(query, domain),
+                lambda: self._lookup_duckduckgo_html(query, domain),
                 lambda: self._lookup_wikipedia(query, domain, "zh"),
                 lambda: self._lookup_wikipedia(query, domain, "en"),
             ]
@@ -509,20 +568,32 @@ class OnlineCategoryClassifier:
         if not re.search(r"[\u4e00-\u9fff]", query):
             providers.append(lambda: self._lookup_baidu(query, domain))
 
+        best = CategoryLookupResult("其他", 0.0, "multi")
         for provider in providers:
             try:
                 result = provider()
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 continue
-            if result.category != "其他":
-                return result
-            if result.source in {"duckduckgo", "baidu"} and result.summary:
+            candidate = result if result.category != "其他" else None
+            if result.source in {"duckduckgo", "duckduckgo-html", "baidu"} and result.summary:
                 fallback_category, fallback_conf = self._classify_text(" ".join((query, result.summary)))
                 if fallback_category != "其他" and fallback_conf >= 0.55:
-                    return CategoryLookupResult(fallback_category, fallback_conf, result.source, result.summary)
+                    candidate = CategoryLookupResult(fallback_category, fallback_conf, result.source, result.summary)
+            if candidate and candidate.confidence > best.confidence:
+                best = candidate
+            if candidate and candidate.confidence >= 0.70:
+                return candidate
 
+        if best.category != "其他" and best.confidence >= 0.55:
+            return best
         return CategoryLookupResult("其他", 0.0, "multi")
+
+    def _is_generic_content_domain(self, domain: str) -> bool:
+        return is_generic_content_domain(domain)
+
+    def _is_broad_platform_bucket(self, domain: str, category: str) -> bool:
+        return self._is_generic_content_domain(domain) and category in BROAD_PLATFORM_CATEGORIES
 
     def _lookup_baidu(self, query: str, domain: str) -> CategoryLookupResult:
         params = urllib.parse.urlencode({"wd": query})
@@ -561,6 +632,30 @@ class OnlineCategoryClassifier:
             category, confidence = self._classify_text(domain)
         return CategoryLookupResult(category, confidence, "duckduckgo", summary[:260])
 
+    def _lookup_duckduckgo_html(self, query: str, domain: str) -> CategoryLookupResult:
+        params = urllib.parse.urlencode({"q": query})
+        text = self._fetch_text(f"https://duckduckgo.com/html/?{params}")
+        pieces = []
+        for pattern in (
+            r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>',
+            r'<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>',
+            r'<div[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</div>',
+        ):
+            for match in re.finditer(pattern, text, re.I | re.S):
+                piece = html_lib.unescape(re.sub(r"<[^>]+>", " ", match.group(1)))
+                piece = re.sub(r"\s+", " ", piece).strip()
+                if piece:
+                    pieces.append(piece)
+                if len(pieces) >= 8:
+                    break
+            if len(pieces) >= 8:
+                break
+        summary = " ".join(pieces).strip()
+        category, confidence = self._classify_text(" ".join((query, summary)))
+        if category == "其他" and domain:
+            category, confidence = self._classify_text(domain)
+        return CategoryLookupResult(category, confidence, "duckduckgo-html", summary[:260])
+
     def _lookup_wikipedia(self, query: str, domain: str, lang: str = "en") -> CategoryLookupResult:
         """Query Wikipedia search API as a fallback classification source."""
         base = f"https://{lang}.wikipedia.org/w/api.php"
@@ -593,8 +688,10 @@ class OnlineCategoryClassifier:
 
     def _query(self, exe_name: str, domain: str, title: str) -> str:
         domain = (domain or "").strip()
-        title = re.sub(r"\s+", " ", (title or "").strip())
+        title = clean_lookup_title(domain, title)
         exe_name = (exe_name or "").strip()
+        if domain and self._is_generic_content_domain(domain):
+            return title[:120] if title else domain
         if domain:
             return f"{domain} {title[:80]}".strip()
         if exe_name and title:
@@ -602,7 +699,7 @@ class OnlineCategoryClassifier:
         # For exe-only or title-only queries, add context to help disambiguate
         if exe_name:
             return f"{exe_name} software application what is".strip()
-        return f"{title[:100]} software" if title else ""
+        return normalize_lookup_text(title[:100], "software") if title else ""
 
     def _classify_text(self, text: str) -> tuple[str, float]:
         text_l = (text or "").casefold()

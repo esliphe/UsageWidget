@@ -94,33 +94,33 @@ cat._cache["good|key|1"] = (time.monotonic() - 100, CategoryLookupResult("编程
 result = cat.cached("good", "key", "1")
 check("Good result valid after 100s", result is not None, f"result={result}")
 
-# ---- 3. DuckDuckGo API live test ----
-print("\n=== DuckDuckGo API live test ===")
+# ---- 3. Category lookup live/fallback test ----
+print("\n=== Category lookup live/fallback test ===")
 
 try:
     result = cat._lookup("", "python.org", "Python Programming Language")
-    check("DDG Python lookup returns result", result.source == "duckduckgo",
-          f"category={result.category} conf={result.confidence:.2f}")
+    check("Python lookup returns useful category", result.category in ("编程", "学习") and result.confidence >= 0.55,
+          f"category={result.category} conf={result.confidence:.2f} source={result.source}")
 except Exception as exc:
-    check("DDG lookup graceful fail", False, f"{type(exc).__name__}: {exc}")
+    check("Python lookup graceful fail", False, f"{type(exc).__name__}: {exc}")
 
 time.sleep(1.5)
 
 try:
     result = cat._lookup("steam.exe", "", "Counter-Strike 2")
-    check("DDG Steam game lookup", result.category in ("游戏", "其他"),
-          f"category={result.category} conf={result.confidence:.2f}")
+    check("Steam game lookup", result.category in ("游戏", "其他"),
+          f"category={result.category} conf={result.confidence:.2f} source={result.source}")
 except Exception as exc:
-    check("DDG Steam lookup fail", False, f"{type(exc).__name__}: {exc}")
+    check("Steam lookup fail", False, f"{type(exc).__name__}: {exc}")
 
 time.sleep(1.5)
 
 try:
     result = cat._lookup("onenote.exe", "", "OneNote - Class Notes - Biology 101")
-    check("DDG OneNote class notes lookup", result.source == "duckduckgo",
-          f"category={result.category} conf={result.confidence:.2f}")
+    check("OneNote class notes lookup", result.category in ("办公", "学习") and result.confidence >= 0.55,
+          f"category={result.category} conf={result.confidence:.2f} source={result.source}")
 except Exception as exc:
-    check("DDG OneNote lookup fail", False, f"{type(exc).__name__}: {exc}")
+    check("OneNote lookup fail", False, f"{type(exc).__name__}: {exc}")
 
 # ---- 4. OnlineMusicVerifier ----
 print("\n=== OnlineMusicVerifier ===")

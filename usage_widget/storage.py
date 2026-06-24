@@ -103,10 +103,10 @@ DEFAULT_CATEGORY_RULES = [
     ("iqiyi.com", "视频", "domain"),
     ("v.qq.com", "视频", "domain"),
     ("mgtv.com", "视频", "domain"),
-    ("douyin.com", "视频", "domain"),
+    ("douyin.com", "娱乐", "domain"),
     ("weixin.exe", "聊天", "app"),
     ("qq.exe", "聊天", "app"),
-    ("weibo.com", "社交", "domain"),
+    ("weibo.com", "娱乐", "domain"),
     ("x.com", "社交", "domain"),
     ("twitter.com", "社交", "domain"),
     ("kugou", "音乐", "app"),
@@ -759,7 +759,31 @@ class Storage:
             "CREATE INDEX IF NOT EXISTS idx_content_date_kind ON content_usage_daily (usage_date, kind)"
         )
         self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_kind_date ON content_usage_daily (kind, usage_date)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_date_category ON content_usage_daily (usage_date, category)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_date_learning_topic ON content_usage_daily (usage_date, learning_topic)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_kind_date_domain ON content_usage_daily (kind, usage_date, content_domain)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_date_path_nocase ON content_usage_daily (usage_date, exe_path COLLATE NOCASE)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_date_lower_path ON content_usage_daily (usage_date, lower(exe_path))"
+        )
+        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_usage_date_path ON usage_daily (usage_date, exe_path)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_date_path_nocase ON usage_daily (usage_date, exe_path COLLATE NOCASE)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_date_lower_path ON usage_daily (usage_date, lower(exe_path))"
         )
         self.conn.execute(
             """
@@ -881,6 +905,8 @@ class Storage:
             [
                 ("聊天", "qq.exe", "app", "社交"),
                 ("聊天", "weixin.exe", "app", "社交"),
+                ("娱乐", "douyin.com", "domain", "视频"),
+                ("娱乐", "weibo.com", "domain", "社交"),
             ],
         )
         self._apply_default_category_rules_to_existing()
@@ -1372,8 +1398,8 @@ class Storage:
                    COALESCE(SUM(running_seconds), 0) AS running_seconds,
                    MAX(last_seen) AS last_seen
             FROM usage_daily
-            WHERE usage_date = ? AND lower(exe_path) IN ({placeholders})
-            GROUP BY lower(exe_path)
+            WHERE usage_date = ? AND exe_path COLLATE NOCASE IN ({placeholders})
+            GROUP BY exe_path COLLATE NOCASE
             """,
             [usage_date, *lookup_paths],
         ).fetchall()
@@ -1408,8 +1434,8 @@ class Storage:
                    COALESCE(SUM(foreground_seconds), 0) AS foreground_seconds,
                    COALESCE(SUM(running_seconds), 0) AS running_seconds
             FROM usage_daily
-            WHERE lower(exe_path) IN ({placeholders})
-            GROUP BY lower(exe_path)
+            WHERE exe_path COLLATE NOCASE IN ({placeholders})
+            GROUP BY exe_path COLLATE NOCASE
             """,
             lookup_paths,
         ).fetchall()
@@ -1486,6 +1512,52 @@ class Storage:
             (start_date.isoformat(), end_date.isoformat()),
         ).fetchone()
         return float(row["total"] or 0)
+
+    def overview_counts_range(self, start_date: date, end_date: date) -> dict[str, float | int]:
+        """Small aggregate used by the overview tab without loading detail tables."""
+        s = start_date.isoformat()
+        e = end_date.isoformat()
+        process_row = self.conn.execute(
+            """
+            SELECT COUNT(DISTINCT exe_path) AS program_count
+            FROM usage_daily
+            WHERE usage_date BETWEEN ? AND ?
+            """,
+            (s, e),
+        ).fetchone()
+        content_row = self.conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN kind = 'web_page' THEN attention_seconds ELSE 0 END), 0) AS web_attention,
+                COUNT(DISTINCT CASE WHEN kind = 'web_page'
+                    THEN kind || ':' || exe_path || ':' || content_key END) AS web_count,
+                COUNT(DISTINCT CASE WHEN kind = 'video_playback'
+                    THEN kind || ':' || exe_path || ':' || content_key END) AS video_count,
+                COUNT(DISTINCT CASE
+                    WHEN kind = 'media_playback' OR (kind = 'video_playback' AND category = '音乐')
+                    THEN kind || ':' || exe_path || ':' || content_key END) AS music_count,
+                COUNT(DISTINCT CASE WHEN kind = 'web_page' AND content_domain != ''
+                    THEN content_domain END) AS web_domain_count,
+                COUNT(DISTINCT CASE WHEN category != '' THEN category END) AS category_count,
+                COUNT(DISTINCT CASE
+                    WHEN category = '学习' OR learning_topic != ''
+                    THEN CASE WHEN learning_topic != '' THEN learning_topic ELSE '综合学习' END
+                END) AS learning_topic_count
+            FROM content_usage_daily
+            WHERE usage_date BETWEEN ? AND ?
+            """,
+            (s, e),
+        ).fetchone()
+        return {
+            "program_count": int(process_row["program_count"] or 0),
+            "web_attention": float(content_row["web_attention"] or 0),
+            "web_count": int(content_row["web_count"] or 0),
+            "video_count": int(content_row["video_count"] or 0),
+            "music_count": int(content_row["music_count"] or 0),
+            "web_domain_count": int(content_row["web_domain_count"] or 0),
+            "category_count": int(content_row["category_count"] or 0),
+            "learning_topic_count": int(content_row["learning_topic_count"] or 0),
+        }
 
     def day_total_media_playback(self, target_date: date | None = None) -> float:
         usage_date = (target_date or date.today()).isoformat()
@@ -1705,8 +1777,8 @@ class Storage:
             f"""
             SELECT *
             FROM content_usage_daily
-            WHERE usage_date = ? AND lower(exe_path) IN ({placeholders})
-            ORDER BY lower(exe_path), attention_seconds DESC, background_seconds DESC
+            WHERE usage_date = ? AND exe_path COLLATE NOCASE IN ({placeholders})
+            ORDER BY exe_path COLLATE NOCASE, attention_seconds DESC, background_seconds DESC
             """,
             [usage_date, *lookup_paths],
         ).fetchall()

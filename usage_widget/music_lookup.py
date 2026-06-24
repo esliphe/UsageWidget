@@ -7,7 +7,12 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
+from . import __version__
 from .media import parse_music_identity
+
+
+USER_AGENT = f"UsageWidget/{__version__}"
+MUSICBRAINZ_USER_AGENT = f"{USER_AGENT} (local personal usage analytics)"
 
 
 @dataclass(frozen=True)
@@ -71,13 +76,12 @@ class OnlineMusicVerifier:
 
     def _worker(self, key: str, title: str, domain: str) -> None:
         try:
-            now = time.monotonic()
             with self._lock:
+                now = time.monotonic()
                 wait = max(0.0, self.min_interval - (now - self._last_request_at))
+                self._last_request_at = now + wait
             if wait:
                 time.sleep(wait)
-            with self._lock:
-                self._last_request_at = time.monotonic()
             result = self._lookup(title, domain)
             with self._lock:
                 self._cache[key] = (time.monotonic(), result)
@@ -117,7 +121,7 @@ class OnlineMusicVerifier:
 
     def _lookup_itunes(self, query: str, song: str, artist: str) -> MusicLookupResult:
         params = urllib.parse.urlencode({"term": query, "media": "music", "entity": "song", "limit": 5})
-        data = self._fetch_json(f"https://itunes.apple.com/search?{params}", headers={"User-Agent": "UsageWidget/5.6"})
+        data = self._fetch_json(f"https://itunes.apple.com/search?{params}", headers={"User-Agent": USER_AGENT})
         for item in data.get("results", []):
             track = str(item.get("trackName", "")).strip()
             artist_name = str(item.get("artistName", "")).strip()
@@ -129,7 +133,7 @@ class OnlineMusicVerifier:
         params = urllib.parse.urlencode({"query": query, "fmt": "json", "limit": 5})
         data = self._fetch_json(
             f"https://musicbrainz.org/ws/2/recording/?{params}",
-            headers={"User-Agent": "UsageWidget/5.6 (local personal usage analytics)"},
+            headers={"User-Agent": MUSICBRAINZ_USER_AGENT},
         )
         for item in data.get("recordings", []):
             track = str(item.get("title", "")).strip()
@@ -154,7 +158,7 @@ class OnlineMusicVerifier:
         try:
             data = self._fetch_json(
                 f"https://ws.audioscrobbler.com/2.0/?{params}",
-                headers={"User-Agent": "UsageWidget/5.30"},
+                headers={"User-Agent": USER_AGENT},
             )
             tracks = data.get("results", {}).get("trackmatches", {}).get("track", [])
             if not isinstance(tracks, list):

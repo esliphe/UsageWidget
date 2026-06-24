@@ -10,6 +10,7 @@ import html as html_lib
 from dataclasses import dataclass
 
 from . import __version__
+from .classification import clean_lookup_title
 
 
 USER_AGENT = f"UsageWidget/{__version__}"
@@ -100,6 +101,13 @@ LEARNING_INTENT_HINTS = {
     "信号与系统",
     "单片机",
     "嵌入式",
+    "法律",
+    "法学",
+    "刑法",
+    "民法",
+    "法考",
+    "司法考试",
+    "罗翔",
 }
 
 
@@ -225,6 +233,8 @@ TOPIC_HINTS: dict[str, tuple[str, ...]] = {
               "基金", "区块链", "比特币", "货币政策", "gdp", "通胀", "利率"),
     "医学": ("医学", "medicine", "解剖", "生理学", "病理学", "药理学", "临床", "诊断",
              "内科", "外科", "影像", "护理", "中医", "针灸"),
+    "法律/法学": ("法律", "法学", "刑法", "民法", "行政法", "商法", "经济法", "诉讼法",
+                 "法考", "司法考试", "罗翔", "jurisprudence", "legal", "law course"),
     "设计": ("设计", "design", "ui设计", "平面设计", "figma", "photoshop", "摄影",
              "illustrator", "premiere", "剪辑", "调色", "3d建模",
              "blender", "c4d", "cad"),
@@ -277,7 +287,7 @@ def domain_matches(domain: str, candidates: set[str]) -> bool:
 
 
 def has_learning_intent(domain: str, text: str, kind: str = "") -> bool:
-    text_l = (text or "").casefold()
+    text_l = clean_lookup_title(domain, text).casefold()
     if any(hint.casefold() in text_l for hint in LEARNING_INTENT_HINTS):
         return True
     if domain_matches(domain, LEARNING_DOMAINS):
@@ -287,21 +297,23 @@ def has_learning_intent(domain: str, text: str, kind: str = "") -> bool:
                         "lecture", "tutorial", "course", "lesson", "explain", "introduction",
                         "习题", "例题", "考点", "考试", "真题", "复习", "考研",
                         "期末", "期中", "不挂科", "突击", "速成", "冲刺", "备考",
-                        "必备", "大学物理", "高数", "线代", "概率论", "蜂考")
+                        "必备", "大学物理", "高数", "线代", "概率论", "蜂考",
+                        "法律", "法学", "刑法", "民法", "法考", "司法考试")
         if any(hint in text_l for hint in edu_patterns):
             return True
     if kind == "video_playback" and domain_matches(domain, VIDEO_LEARNING_DOMAINS):
         # Only flag video as learning if title text also suggests educational content
         edu_patterns = ("课程", "教程", "讲解", "学习", "课", "公开课", "讲义", "复习",
                         "lecture", "tutorial", "course", "lesson", "education", "learn",
-                        "期末", "不挂科", "突击", "速成", "考点", "备考", "蜂考")
+                        "期末", "不挂科", "突击", "速成", "考点", "备考", "蜂考",
+                        "法律", "法学", "刑法", "民法", "法考", "司法考试")
         if any(hint in text_l for hint in edu_patterns):
             return True
     return False
 
 
 def local_learning_topic(text: str) -> LearningTopicResult:
-    text_l = (text or "").casefold()
+    text_l = clean_lookup_title("", text).casefold()
     if not text_l:
         return LearningTopicResult("", 0.0, "empty")
     scores: dict[str, int] = {}
@@ -396,13 +408,12 @@ class OnlineLearningTopicClassifier:
 
     def _worker(self, key: str, domain: str, title: str, description: str) -> None:
         try:
-            now = time.monotonic()
             with self._lock:
+                now = time.monotonic()
                 wait = max(0.0, self.min_interval - (now - self._last_request_at))
+                self._last_request_at = now + wait
             if wait:
                 time.sleep(wait)
-            with self._lock:
-                self._last_request_at = time.monotonic()
             result = self._lookup(domain, title, description)
             with self._lock:
                 self._cache[key] = (time.monotonic(), result)
@@ -419,10 +430,11 @@ class OnlineLearningTopicClassifier:
                 self._active_workers -= 1
 
     def _lookup(self, domain: str, title: str, description: str) -> LearningTopicResult:
-        query_text = normalize_text(title[:120], description[:100])
+        clean_title = clean_lookup_title(domain, title)
+        query_text = normalize_text(clean_title[:120], description[:100])
         domain_clean = domain.replace("www.", "").lower()
-        if "bilibili.com" in domain_clean:
-            query_text = normalize_text(title[:160])
+        if "bilibili.com" in domain_clean or domain_clean.endswith("b23.tv"):
+            query_text = normalize_text(clean_title[:160])
         local = local_learning_topic(query_text)
         if local.topic and local.confidence >= 0.62 and has_learning_intent(domain, query_text):
             return LearningTopicResult(local.topic, max(local.confidence, 0.72), "local-query", query_text[:300])
@@ -478,8 +490,8 @@ class OnlineLearningTopicClassifier:
             if has_learning_intent(domain_clean, combined):
                 conf = min(0.94, conf + 0.08)
             return LearningTopicResult(local.topic, conf, "baidu", summary[:300])
-        if "bilibili" in domain_clean or "youtube" in domain_clean:
-            alt = local_learning_topic(normalize_text(title[:200], summary[:200]))
+        if "bilibili" in domain_clean or domain_clean.endswith("b23.tv") or "youtube" in domain_clean:
+            alt = local_learning_topic(normalize_text(clean_lookup_title(domain_clean, title)[:200], summary[:200]))
             if alt.topic:
                 return LearningTopicResult(alt.topic, max(alt.confidence, 0.60), "baidu", summary[:300])
         return LearningTopicResult("", 0.0, "baidu", summary[:300])
@@ -505,8 +517,8 @@ class OnlineLearningTopicClassifier:
             if len(query_text) >= 20 and local.confidence >= 0.60:
                 conf = min(0.92, conf + 0.08)
             return LearningTopicResult(local.topic, conf, "duckduckgo", summary[:300])
-        if "bilibili" in domain_clean or "youtube" in domain_clean:
-            alt = local_learning_topic(normalize_text(title[:200], summary[:200]))
+        if "bilibili" in domain_clean or domain_clean.endswith("b23.tv") or "youtube" in domain_clean:
+            alt = local_learning_topic(normalize_text(clean_lookup_title(domain_clean, title)[:200], summary[:200]))
             if alt.topic:
                 return LearningTopicResult(alt.topic, max(alt.confidence, 0.60), "duckduckgo", summary[:300])
         return LearningTopicResult("", 0.0, "duckduckgo", summary[:300])
@@ -538,8 +550,8 @@ class OnlineLearningTopicClassifier:
             if local.topic:
                 conf = max(local.confidence, 0.60)
                 return LearningTopicResult(local.topic, conf, f"wiki-{lang}", summary[:300])
-            if "bilibili" in domain_clean or "youtube" in domain_clean:
-                alt = local_learning_topic(normalize_text(title[:200], summary[:200]))
+            if "bilibili" in domain_clean or domain_clean.endswith("b23.tv") or "youtube" in domain_clean:
+                alt = local_learning_topic(normalize_text(clean_lookup_title(domain_clean, title)[:200], summary[:200]))
                 if alt.topic:
                     return LearningTopicResult(alt.topic, max(alt.confidence, 0.55), f"wiki-{lang}", summary[:300])
             return LearningTopicResult("", 0.0, f"wiki-{lang}", summary[:300])

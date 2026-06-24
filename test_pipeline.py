@@ -51,7 +51,7 @@ topic_tests = [
 for title, expected_topic in topic_tests:
     r = local_learning_topic(normalize_text(title))
     ok = (r.topic == expected_topic) or (expected_topic == "" and not r.topic)
-    check(f"topic for '{title[:35]}' -> {r.topic}", ok, f"got {r.topic!r}")
+    check(f"topic for '{title[:35]}' -> {r.topic}", ok)
 
 print("\n=== 4. should_mark_learning for video_playback ===")
 for title, topic, expected in [
@@ -68,11 +68,13 @@ cat_tests = [
     ("大学物理-光学 蜂考 期末突击", "学习"),
     ("高等数学 同济版 全程精讲 猴博士", "学习"),
     ("【原神】新角色实况", "游戏"),
-    ("搞笑视频合集", "视频"),
+    ("搞笑视频合集", "娱乐"),
+    ("手机开箱测评 好物推荐", "购物"),
+    ("今日热点 新闻资讯", "新闻"),
 ]
 for title, expected_cat in cat_tests:
     cat = m._category_for("browser", "", title, settings)
-    check(f"category_for '{title[:30]}' -> {cat}", cat == expected_cat, f"got {cat!r}")
+    check(f"category_for '{title[:30]}' -> {cat}", cat == expected_cat)
 
 print("\n=== 6. Full pipeline simulation (SMTC video_playback) ===")
 smtic_titles = [
