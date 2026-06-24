@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QEvent, QFileInfo, QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFontMetrics, QIcon, QMouseEvent, QPainter, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -58,6 +58,119 @@ from .timefmt import format_duration, format_duration_long, format_duration_smar
 
 FULL_SIZE = (400, 520)
 COLLAPSED_SIZE = (500, 118)
+UI_FONT_CANDIDATES = (
+    "Microsoft YaHei UI",
+    "Microsoft YaHei",
+    "SimSun",
+    "Noto Sans CJK SC",
+    "Source Han Sans SC",
+    "Segoe UI",
+    "Arial",
+)
+GENERIC_CONTENT_DOMAIN_HINTS = (
+    "bilibili.com",
+    "youtube.com",
+    "douyin.com",
+    "kuaishou.com",
+    "xiaohongshu.com",
+    "weibo.com",
+    "zhihu.com",
+)
+
+
+def ui_font_family() -> str:
+    try:
+        available = {family.casefold(): family for family in QFontDatabase.families()}
+        for family in UI_FONT_CANDIDATES:
+            matched = available.get(family.casefold())
+            if matched:
+                return matched
+    except Exception:
+        pass
+    try:
+        fallback = QApplication.font().family()
+        if fallback:
+            return fallback
+    except Exception:
+        pass
+    return "Microsoft YaHei UI"
+
+
+def ui_font_stack() -> str:
+    return ", ".join(f'"{family}"' for family in UI_FONT_CANDIDATES)
+
+
+def apply_app_font(app: QApplication) -> None:
+    app.setFont(QFont(ui_font_family(), 9))
+
+
+def learning_feature_state(settings: AppSettings) -> str:
+    if settings.private_title_mode:
+        return "本地开启；联网增强关闭（隐私模式）"
+    if settings.online_category_lookup:
+        return "本地开启；联网增强开启"
+    return "本地开启；联网增强关闭"
+
+
+def show_operation_error(parent: QWidget | None, title: str, exc: Exception) -> None:
+    QMessageBox.critical(parent, title, f"操作失败：\n{exc}\n\n可在运行诊断中查看日志路径。")
+
+
+def is_generic_content_domain(domain: str) -> bool:
+    lowered = domain.casefold()
+    return any(hint in lowered for hint in GENERIC_CONTENT_DOMAIN_HINTS)
+
+
+def cleanup_rule_title(title: str) -> str:
+    value = title.strip()
+    for suffix in (" - 哔哩哔哩", "_哔哩哔哩_bilibili", " - bilibili", " - YouTube"):
+        if value.endswith(suffix):
+            value = value[: -len(suffix)].strip()
+    return value[:80]
+
+
+def quality_summary_text(quality: dict[str, int | float | str]) -> str:
+    return (
+        f"{quality.get('score', 100)}/100 · {quality.get('level', '良好')} · "
+        f"仅域名 {quality.get('web_domain_only_rows', 0)} · "
+        f"泛视频 {quality.get('broad_video_rows', 0)} · "
+        f"低置信 {quality.get('low_confidence_rows', 0)}"
+    )
+
+
+TARGET_LABELS = {"title": "标题", "domain": "域名", "app": "程序", "any": "全部"}
+SOURCE_LABELS = {"default": "本地规则", "user": "用户纠正", "online": "联网分类"}
+
+
+def target_label(value: str) -> str:
+    return TARGET_LABELS.get(value, value or "全部")
+
+
+def source_label(value: str) -> str:
+    return SOURCE_LABELS.get(value, value or "用户纠正")
+
+
+def short_activity_hint(exe_name: str = "", domain: str = "", title: str = "", category: str = "") -> str:
+    text = " ".join((exe_name, domain, title, category)).casefold()
+    hints = [
+        (("dazidazi.com", "dazidazi", "monkeytype", "10fastfingers", "typing", "type practice", "打字", "键盘练习"), "打字"),
+        (("codex", "chatgpt", "openai", "claude", "deepseek", "kimi", "doubao"), "AI助手"),
+        (("figma", "canva", "photoshop", "illustrator", "sketch"), "设计"),
+        (("excalidraw", "draw.io", "diagram", "流程图"), "绘图"),
+        (("notion", "obsidian", "onenote", "笔记"), "笔记"),
+        (("gmail", "outlook", "mail", "邮箱", "邮件"), "邮件"),
+        (("calendar", "日历", "日程"), "日程"),
+        (("translate", "翻译"), "翻译"),
+        (("github", "vscode", "visual studio", "pycharm", "编程", "代码"), "编程"),
+        (("docs", "word", "文档"), "文档"),
+        (("excel", "sheet", "表格"), "表格"),
+    ]
+    for keys, label in hints:
+        if any(key in text for key in keys):
+            return label
+    if category in {"学习", "编程", "游戏", "音乐", "娱乐", "购物", "新闻", "聊天", "办公"}:
+        return category
+    return ""
 
 
 def build_app_icon() -> QIcon:
@@ -116,7 +229,7 @@ def data_definition_text() -> str:
         "- 后台音乐不会并入前台注视，但会进入音乐播放和音乐分析。\n"
         "- 当前运行列表可以切换排序：当前优先、前台排行、运行排行、按名称；行内标题只是补充说明，不参与排序。\n"
         "- 空闲时默认不累计前台注视；如果开启媒体/手写豁免，播放视频音乐或 OneNote 手写场景可继续计入。\n"
-        "- 联网分类增强只在本地规则识别为“其他”时使用，隐私模式下自动关闭，不会覆盖你手动添加的分类规则。"
+        "- 联网分类增强会在本地不确定，或 B 站等泛内容平台只得到宽泛分类时尝试细分；隐私模式下自动关闭，不会覆盖你手动添加的分类规则。"
     )
 
 
@@ -855,7 +968,7 @@ class SettingsDialog(QDialog):
         self.online_music_lookup_box.setChecked(settings.online_music_lookup)
         general_layout.addWidget(self.online_music_lookup_box)
 
-        self.online_category_lookup_box = QCheckBox("联网增强程序/网页分类（可选，仅本地规则为“其他”时使用）")
+        self.online_category_lookup_box = QCheckBox("联网增强程序/网页分类（本地不确定或泛内容平台粗分类时使用）")
         self.online_category_lookup_box.setChecked(settings.online_category_lookup)
         general_layout.addWidget(self.online_category_lookup_box)
         self.private_title_box.toggled.connect(self._sync_privacy_dependent_controls)
@@ -1008,14 +1121,14 @@ class SettingsDialog(QDialog):
         category_layout = QVBoxLayout(category_panel)
         category_layout.setContentsMargins(12, 12, 12, 12)
         category_layout.setSpacing(8)
-        category_layout.addWidget(QLabel("网页/内容分类规则（target: app / domain / title / any）"))
-        self.category_table = QTableWidget(0, 3)
-        self.category_table.setHorizontalHeaderLabels(["关键词", "分类", "匹配位置"])
+        category_layout.addWidget(QLabel("网页/内容分类规则（匹配位置：程序/域名/标题/全部；来源区分本地、联网和用户纠正）"))
+        self.category_table = QTableWidget(0, 4)
+        self.category_table.setHorizontalHeaderLabels(["关键词", "分类", "匹配位置", "来源"])
         self.category_table.verticalHeader().setVisible(False)
         self.category_table.horizontalHeader().setStretchLastSection(True)
         self.category_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         for row in self.storage.category_rules():
-            self._append_category_rule(str(row["pattern"]), str(row["category"]), str(row["target"]))
+            self._append_category_rule(str(row["pattern"]), str(row["category"]), str(row["target"]), str(row["source"] or "user"))
         category_layout.addWidget(self.category_table, 1)
 
         category_row = QHBoxLayout()
@@ -1024,7 +1137,8 @@ class SettingsDialog(QDialog):
         self.category_name_input = QLineEdit()
         self.category_name_input.setPlaceholderText("例如: 游戏 / 学习")
         self.category_target_combo = QComboBox()
-        self.category_target_combo.addItems(["title", "domain", "app", "any"])
+        for label, value in (("标题", "title"), ("域名", "domain"), ("程序", "app"), ("全部", "any")):
+            self.category_target_combo.addItem(label, value)
         add_category_button = QPushButton("添加规则")
         remove_category_button = QPushButton("删除选中")
         restore_category_button = QPushButton("恢复默认规则")
@@ -1143,7 +1257,7 @@ class SettingsDialog(QDialog):
 
         self.setStyleSheet(
             """
-            QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Segoe UI"; }
+            QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "Noto Sans CJK SC", "Segoe UI", "Arial"; }
             QFrame#settingsPanel { background: white; border: 1px solid #d9e1ea; border-radius: 8px; }
             QLabel#sectionLabel { color: #607089; font-weight: 700; }
             QLabel#settingsHint { color: #64748b; font-size: 12px; }
@@ -1174,7 +1288,7 @@ class SettingsDialog(QDialog):
         privacy_enabled = self.private_title_box.isChecked()
         privacy_tip = "隐私模式下不会进行联网音乐校验或联网分类。关闭隐私模式后会恢复这里保存的开关状态。"
         music_tip = "联网校验网页标题是否为音乐；仅在关闭隐私模式时生效。"
-        category_tip = "联网增强程序/网页分类；仅在关闭隐私模式且本地规则不确定时生效。"
+        category_tip = "联网增强程序/网页分类；关闭隐私模式时，在本地不确定或泛内容平台粗分类时尝试细分。"
         for widget, normal_tip in (
             (self.online_music_lookup_box, music_tip),
             (self.online_category_lookup_box, category_tip),
@@ -1255,19 +1369,25 @@ class SettingsDialog(QDialog):
         for name in sorted(DEFAULT_IGNORED):
             self.ignore_list.addItem(name)
 
-    def _append_category_rule(self, pattern: str, category: str, target: str) -> None:
+    def _append_category_rule(self, pattern: str, category: str, target: str, source: str = "user") -> None:
         row = self.category_table.rowCount()
         self.category_table.insertRow(row)
-        for col, value in enumerate((pattern, category, target)):
-            self.category_table.setItem(row, col, QTableWidgetItem(value))
+        values = (pattern, category, target_label(target), source_label(source))
+        for col, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            if col == 2:
+                item.setData(Qt.ItemDataRole.UserRole, target)
+            elif col == 3:
+                item.setData(Qt.ItemDataRole.UserRole, source)
+            self.category_table.setItem(row, col, item)
 
     def add_category_rule(self) -> None:
         pattern = self.category_pattern_input.text().strip().lower()
         category = self.category_name_input.text().strip() or "其他"
-        target = str(self.category_target_combo.currentText()).strip() or "any"
+        target = str(self.category_target_combo.currentData() or "any")
         if not pattern:
             return
-        self._append_category_rule(pattern, category, target)
+        self._append_category_rule(pattern, category, target, "user")
         self.category_pattern_input.clear()
         self.category_name_input.clear()
 
@@ -1279,18 +1399,21 @@ class SettingsDialog(QDialog):
     def restore_default_category_rules(self) -> None:
         self.category_table.setRowCount(0)
         for pattern, category, target in DEFAULT_CATEGORY_RULES:
-            self._append_category_rule(pattern, category, target)
+            self._append_category_rule(pattern, category, target, "default")
 
-    def category_rule_rows(self) -> list[tuple[str, str, str]]:
+    def category_rule_rows(self) -> list[tuple[str, str, str, str]]:
         rules = []
         for row in range(self.category_table.rowCount()):
             values = []
-            for col in range(3):
+            for col in range(4):
                 item = self.category_table.item(row, col)
-                values.append(item.text().strip() if item else "")
-            pattern, category, target = values
+                if item and col in {2, 3}:
+                    values.append(str(item.data(Qt.ItemDataRole.UserRole) or item.text()).strip())
+                else:
+                    values.append(item.text().strip() if item else "")
+            pattern, category, target, source = values
             if pattern:
-                rules.append((pattern, category or "其他", target or "any"))
+                rules.append((pattern, category or "其他", target or "any", source or "user"))
         return rules
 
     def ignored_names(self) -> list[str]:
@@ -1301,37 +1424,41 @@ class SettingsDialog(QDialog):
                 names.append(item.text())
         return names
 
+    def _run_file_action(self, success_title: str, success_text: str, action) -> None:
+        try:
+            action()
+        except Exception as exc:
+            show_operation_error(self, success_title.replace("完成", "失败"), exc)
+            return
+        QMessageBox.information(self, success_title, success_text)
+
     def export_csv(self) -> None:
         default_name = f"usage-widget-{date.today().isoformat()}.csv"
         path, _ = QFileDialog.getSaveFileName(self, "导出 CSV", default_name, "CSV Files (*.csv)")
         if not path:
             return
-        self.storage.export_csv(Path(path))
-        QMessageBox.information(self, "导出完成", f"已导出到：\n{path}")
+        self._run_file_action("导出完成", f"已导出到：\n{path}", lambda: self.storage.export_csv(Path(path)))
 
     def export_content_csv(self) -> None:
         default_name = f"usage-widget-content-{date.today().isoformat()}.csv"
         path, _ = QFileDialog.getSaveFileName(self, "导出内容 CSV", default_name, "CSV Files (*.csv)")
         if not path:
             return
-        self.storage.export_content_csv(Path(path))
-        QMessageBox.information(self, "导出完成", f"已导出到：\n{path}")
+        self._run_file_action("导出完成", f"已导出到：\n{path}", lambda: self.storage.export_content_csv(Path(path)))
 
     def export_music_csv(self) -> None:
         default_name = f"usage-widget-music-{date.today().isoformat()}.csv"
         path, _ = QFileDialog.getSaveFileName(self, "导出音乐分析 CSV", default_name, "CSV Files (*.csv)")
         if not path:
             return
-        self.storage.export_music_csv(Path(path))
-        QMessageBox.information(self, "导出完成", f"已导出到：\n{path}")
+        self._run_file_action("导出完成", f"已导出到：\n{path}", lambda: self.storage.export_music_csv(Path(path)))
 
     def export_learning_csv(self) -> None:
         default_name = f"usage-widget-learning-{date.today().isoformat()}.csv"
         path, _ = QFileDialog.getSaveFileName(self, "导出学习分析 CSV", default_name, "CSV Files (*.csv)")
         if not path:
             return
-        self.storage.export_learning_csv(Path(path))
-        QMessageBox.information(self, "导出完成", f"已导出到：\n{path}")
+        self._run_file_action("导出完成", f"已导出到：\n{path}", lambda: self.storage.export_learning_csv(Path(path)))
 
     def clear_usage_data(self) -> None:
         answer = QMessageBox.warning(
@@ -1342,7 +1469,11 @@ class SettingsDialog(QDialog):
             QMessageBox.StandardButton.Cancel,
         )
         if answer == QMessageBox.StandardButton.Yes:
-            self.storage.delete_usage()
+            try:
+                self.storage.delete_usage()
+            except Exception as exc:
+                show_operation_error(self, "清除失败", exc)
+                return
             self.data_changed.emit()
 
     def backup_database(self) -> None:
@@ -1350,19 +1481,21 @@ class SettingsDialog(QDialog):
         path, _ = QFileDialog.getSaveFileName(self, "备份数据库", default_name, "SQLite Database (*.sqlite *.db)")
         if not path:
             return
-        self.storage.backup_database(Path(path))
-        QMessageBox.information(self, "备份完成", f"已备份到：\n{path}")
+        self._run_file_action("备份完成", f"已备份到：\n{path}", lambda: self.storage.backup_database(Path(path)))
 
     def optimize_database(self) -> None:
-        self.storage.optimize_database()
-        QMessageBox.information(self, "优化完成", "数据库索引统计和 WAL 检查点已更新。")
+        self._run_file_action("优化完成", "数据库索引统计和 WAL 检查点已更新。", self.storage.optimize_database)
 
     def cleanup_timeline(self) -> None:
         retention_days = self.retention_spin.value()
         if retention_days <= 0:
             QMessageBox.information(self, "未清理", "当前设置为永久保留时间线。")
             return
-        removed = self.storage.cleanup_old_timeline_events(retention_days)
+        try:
+            removed = self.storage.cleanup_old_timeline_events(retention_days)
+        except Exception as exc:
+            show_operation_error(self, "清理失败", exc)
+            return
         self.data_changed.emit()
         QMessageBox.information(self, "清理完成", f"已清理 {removed} 条旧时间线事件，保留最近 {retention_days} 天。")
 
@@ -1481,7 +1614,7 @@ class DiagnosticsDialog(QDialog):
 
         self.setStyleSheet(
             """
-            QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Segoe UI"; }
+            QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "Noto Sans CJK SC", "Segoe UI", "Arial"; }
             QLabel#statsTitle { font-size: 18px; font-weight: 700; }
             QTableWidget, QPlainTextEdit {
                 background: white;
@@ -1525,12 +1658,17 @@ class DiagnosticsDialog(QDialog):
         log_file = log_path()
         db_stats = self.storage.database_stats()
         latest_page_signal_count = self.monitor.browser_bridge.page_signal_count()
+        health_7d = self.storage.recognition_health_range(date.today() - timedelta(days=6), date.today())
         rows = [
             ("数据库路径", str(self.storage.db_path)),
             ("数据库大小", self._format_size(self.storage.database_size_bytes())),
             ("进程日汇总行数", str(db_stats.get("usage_daily_rows", 0))),
             ("内容日汇总行数", str(db_stats.get("content_usage_daily_rows", 0))),
             ("时间线事件行数", str(db_stats.get("timeline_events_rows", 0))),
+            ("识别健康度（近 7 天）", quality_summary_text(health_7d)),
+            ("仅域名无标题网页（近 7 天）", str(health_7d.get("web_domain_only_rows", 0))),
+            ("仍归为“视频”的播放（近 7 天）", str(health_7d.get("broad_video_rows", 0))),
+            ("低置信内容（近 7 天）", str(health_7d.get("low_confidence_rows", 0))),
             ("时间线范围", f"{db_stats.get('timeline_start', '') or '无'} ~ {db_stats.get('timeline_end', '') or '无'}"),
             ("分类规则数", str(db_stats.get("category_rules_rows", 0))),
             ("诊断日志", str(log_file)),
@@ -1556,8 +1694,8 @@ class DiagnosticsDialog(QDialog):
             ("联网分类来源", self.monitor.category_classifier.last_source or "无"),
             ("联网分类查询", self.monitor.category_classifier.last_query or "无"),
             ("联网分类错误", self.monitor.category_classifier.last_error or "无"),
-            ("学习主题分类", online_feature_state(settings.online_category_lookup, settings.private_title_mode)),
-            ("学习主题来源", self.monitor.learning_classifier.last_source or "无"),
+            ("学习主题识别", learning_feature_state(settings)),
+            ("学习主题来源", self.monitor.learning_classifier.last_source or "本地规则"),
             ("学习主题查询", self.monitor.learning_classifier.last_query or "无"),
             ("学习主题错误", self.monitor.learning_classifier.last_error or "无"),
             ("发声标签页", str(len(audible_tabs))),
@@ -1604,10 +1742,14 @@ class CurrentStatusDialog(QDialog):
         header = QHBoxLayout()
         title = QLabel("当前状态")
         title.setObjectName("statsTitle")
+        self.category_correction_button = QPushButton("纠正分类")
+        self.category_correction_button.setToolTip("把当前网页、视频或前台程序保存为新的分类规则")
+        self.category_correction_button.clicked.connect(self.correct_current_category)
         refresh_button = QPushButton("刷新")
         refresh_button.clicked.connect(self.refresh)
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self.category_correction_button)
         header.addWidget(refresh_button)
         root.addLayout(header)
 
@@ -1645,7 +1787,7 @@ class CurrentStatusDialog(QDialog):
 
         self.setStyleSheet(
             """
-            QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Segoe UI"; }
+            QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "Noto Sans CJK SC", "Segoe UI", "Arial"; }
             QLabel#statsTitle { font-size: 18px; font-weight: 700; }
             QLabel#statsNote { color: #607089; }
             QTableWidget, QPlainTextEdit {
@@ -1669,6 +1811,69 @@ class CurrentStatusDialog(QDialog):
             """
         )
         self.refresh()
+
+    def _current_rule_source(self) -> tuple[str, str, str]:
+        latest_tab = self.monitor.browser_bridge.latest(max_age_seconds=3600)
+        if latest_tab:
+            domain = str(getattr(latest_tab, "domain", "") or "").strip().lower()
+            title = cleanup_rule_title(str(getattr(latest_tab, "title", "") or ""))
+            if title and (not domain or is_generic_content_domain(domain)):
+                return title.lower(), "title", f"标题：{title}"
+            if domain:
+                return domain, "domain", f"域名：{domain}"
+        if self.monitor.foreground_title:
+            title = cleanup_rule_title(self.monitor.foreground_title)
+            if title:
+                return title.lower(), "title", f"窗口标题：{title}"
+        if self.monitor.current_foreground_exe:
+            exe = self.monitor.current_foreground_exe.strip().lower()
+            if exe:
+                return exe, "app", f"程序：{exe}"
+        return "", "any", ""
+
+    def _classification_source_text(self) -> str:
+        category = self.monitor.current_category or "无"
+        if category == "无":
+            return "无"
+        latest_tab = self.monitor.browser_bridge.latest(max_age_seconds=60)
+        domain = str(getattr(latest_tab, "domain", "") or "") if latest_tab else ""
+        title = str(getattr(latest_tab, "title", "") or self.monitor.foreground_title or "")
+        exe = self.monitor.current_foreground_exe or ("browser" if latest_tab else "")
+        detail = self.storage.category_explanation(
+            category,
+            exe,
+            domain,
+            title,
+            self.monitor.current_learning_topic or "",
+        )
+        return f"{category} · {detail}"
+
+    def correct_current_category(self) -> None:
+        pattern, target, preview = self._current_rule_source()
+        if not pattern:
+            QMessageBox.information(self, "暂无可纠正内容", "当前没有可用于保存规则的网页、标题或程序。")
+            return
+        categories = ["学习", "编程", "AI 工具", "系统软件", "聊天", "游戏", "视频", "音乐", "娱乐", "社交", "办公", "工具", "网站", "购物", "新闻", "其他", "自定义..."]
+        current = self.monitor.current_category or "其他"
+        index = categories.index(current) if current in categories else len(categories) - 2
+        category, ok = QInputDialog.getItem(self, "纠正当前分类", f"{preview}\n以后归为：", categories, index, False)
+        if not ok or not category:
+            return
+        if category == "自定义...":
+            category, ok = QInputDialog.getText(self, "自定义分类", "分类名称：")
+            if not ok or not category.strip():
+                return
+            category = category.strip()
+        try:
+            self.storage.add_category_rule(pattern, category, target, update_existing=True)
+        except Exception as exc:
+            show_operation_error(self, "保存分类规则失败", exc)
+            return
+        self.refresh()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "refresh_open_dialogs"):
+            QTimer.singleShot(0, parent.refresh_open_dialogs)  # type: ignore[attr-defined]
+        QMessageBox.information(self, "分类规则已保存", f"已添加规则：{target} 包含“{pattern}”时归为“{category}”。")
 
     def _browser_media_detail(self, latest_tab) -> str:
         if not latest_tab:
@@ -1697,6 +1902,7 @@ class CurrentStatusDialog(QDialog):
 
     def refresh(self) -> None:
         settings = self.storage.load_settings()
+        quality = self.storage.recognition_health_range(date.today(), date.today())
         latest_tab = self.monitor.browser_bridge.latest(max_age_seconds=3600)
         audible_tabs = self.monitor.browser_bridge.audible_tabs(max_age_seconds=3600)
         media_items = self.monitor.media_provider.current_items()
@@ -1719,6 +1925,9 @@ class CurrentStatusDialog(QDialog):
             ("前台程序", self.monitor.foreground_path or "未识别"),
             ("前台标题", self.monitor.foreground_title[:160] or "无"),
             ("当前网页", latest_web),
+            ("当前内容分类", self.monitor.current_category or "无"),
+            ("分类依据", self._classification_source_text()),
+            ("最近联网分类", f"{self.monitor.category_classifier.last_source or '无'} · {self.monitor.category_classifier.last_query[:100] if self.monitor.category_classifier.last_query else '无查询'}"),
             ("网页媒体元素", self._browser_media_detail(latest_tab)),
             ("当前视频", current_video),
             ("当前音乐", current_music),
@@ -1726,10 +1935,12 @@ class CurrentStatusDialog(QDialog):
             ("系统媒体会话", "可用" if self.monitor.media_provider.available else "不可用/使用兜底"),
             ("当前媒体项", f"{len(media_items)} 个"),
             ("浏览器扩展", "最近有活动标签页上报" if latest_tab else "最近无活动标签页上报"),
+            ("识别健康度（今天）", quality_summary_text(quality)),
+            ("健康度说明", f"仅域名网页 {quality.get('web_domain_only_rows', 0)} 条；仍归为“视频”的播放 {quality.get('broad_video_rows', 0)} 条；低置信内容 {quality.get('low_confidence_rows', 0)} 条"),
             ("页面内容信号", f"{self.monitor.browser_bridge.page_signal_count()} 条/小时"),
             ("联网音乐校验", online_feature_state(settings.online_music_lookup, settings.private_title_mode)),
             ("联网分类增强", online_feature_state(settings.online_category_lookup, settings.private_title_mode)),
-            ("学习主题识别", online_feature_state(settings.online_category_lookup, settings.private_title_mode)),
+            ("学习主题识别", learning_feature_state(settings)),
             ("当前学习主题", self.monitor.current_learning_topic or "无"),
             ("当前 OneNote 笔记本", self.monitor.current_onenote_notebook or "未检测到"),
             ("当前列表排序", sort_labels.get(settings.top_list_sort, sort_labels["current_first"])),
@@ -1854,19 +2065,19 @@ class StatsDialog(QDialog):
         self.overview_tab = self._make_overview_tab()
         self.trend_tab = self._make_trend_tab()
         self.process_table = self._make_table(["程序", "前台时长", "总运行", "后台", "路径"], sort_column=1)
-        self.web_table = self._make_table(["网页/网站标题", "域名", "分类", "主题", "浏览器", "注视时长", "URL"], sort_column=5)
-        self.video_table = self._make_table(["视频/发声标签页", "域名", "分类", "主题", "播放时长", "URL"], sort_column=4)
-        self.media_table = self._make_table(["播放内容", "分类", "来源", "播放时长", "最后记录"], sort_column=3)
+        self.web_table = self._make_table(["页面标题", "域名", "内容分类", "分类依据", "学习主题", "浏览器", "注视时长", "URL"], sort_column=6)
+        self.video_table = self._make_table(["播放内容", "域名", "内容分类", "分类依据", "学习主题", "播放时长", "URL"], sort_column=5)
+        self.media_table = self._make_table(["播放内容", "内容分类", "分类依据", "来源", "播放时长", "最后记录"], sort_column=4)
         self.music_analysis_table = self._make_table(["歌曲", "歌手", "来源", "播放时长", "占音乐时长", "最后记录"], sort_column=3)
         self.music_analysis_tab = self._make_music_analysis_tab()
         self.artist_analysis_table = self._make_table(["歌手", "播放时长", "歌曲数", "代表歌曲", "来源", "占音乐时长"], sort_column=1)
         self.artist_analysis_tab = self._make_artist_analysis_tab()
         self.learning_analysis_table = self._make_table(["学习主题", "网页注视时长", "视频/播放时长", "总时长", "条目数", "最后记录"], sort_column=3)
         self.learning_analysis_tab = self._make_learning_analysis_tab()
-        self.window_table = self._make_table(["窗口标题", "分类", "主题", "程序", "注视时长", "最后记录"], sort_column=4)
-        self.category_table = self._make_table(["分类", "总时长", "占比", "注视时长", "播放/后台", "条目数", "来源类型", "最后记录"], sort_column=1)
+        self.window_table = self._make_table(["窗口标题", "内容分类", "分类依据", "学习主题", "程序", "注视时长", "最后记录"], sort_column=5)
+        self.category_table = self._make_table(["内容分类", "总时长", "占比", "注视时长", "播放/后台", "条目数", "来源类型", "最后记录"], sort_column=1)
         self.goal_table = self._make_table(["目标", "方向", "当前", "目标值", "状态"], sort_column=2)
-        self.timeline_table = self._make_table(["开始", "类型", "标题", "应用", "分类", "主题", "时长"], sort_column=0)
+        self.timeline_table = self._make_table(["开始", "类型", "标题", "应用", "内容分类", "学习主题", "时长"], sort_column=0)
         self.timeline_tab = self._make_timeline_tab()
         for table, kind in (
             (self.web_table, "web"),
@@ -1877,7 +2088,7 @@ class StatsDialog(QDialog):
             self._install_category_menu(table, kind)
         # Domain and video-domain tables (created here, populated later)
         self.domain_table = self._make_table(["网站域名", "浏览时长", "网页数", "主要页面", "最后访问"], 1)
-        self.video_domain_table = self._make_table(["视频来源", "播放时长", "视频数", "主要视频", "分类", "最后播放"], 1)
+        self.video_domain_table = self._make_table(["播放来源", "播放时长", "视频数", "主要内容", "主要分类", "最后播放"], 1)
 
         # --- Merged tabs: 程序, 网页, 视频, 音乐 ---
         self.programs_tab = self._make_merged_tab(
@@ -1889,8 +2100,8 @@ class StatsDialog(QDialog):
             "网站排行", self.domain_table,
         )
         self.video_tab = self._make_merged_tab(
-            "视频播放", self.video_table,
-            "视频来源", self.video_domain_table,
+            "视频播放内容", self.video_table,
+            "播放来源", self.video_domain_table,
         )
         self.music_tab = QWidget()
         music_layout = QVBoxLayout(self.music_tab)
@@ -1917,14 +2128,14 @@ class StatsDialog(QDialog):
         self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
 
-        note = QLabel("网页注视和窗口标题统计的是前台焦点；音乐播放统计的是后台播放内容，两者不会混在一起计算。")
+        note = QLabel("网页注视和窗口标题统计的是前台焦点；音乐播放统计的是后台播放内容。网页、视频、音乐和窗口表格可右键纠正分类规则。")
         note.setObjectName("statsNote")
         note.setWordWrap(True)
         root.addWidget(note)
 
         self.setStyleSheet(
             """
-            QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Segoe UI"; }
+            QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "Noto Sans CJK SC", "Segoe UI", "Arial"; }
             QLabel#statsTitle { font-size: 18px; font-weight: 700; }
             QLabel#statsNote { color: #607089; }
             QLabel#mergedSectionHeader {
@@ -2271,13 +2482,13 @@ class StatsDialog(QDialog):
             title = self._cell_text(table, row, 0).lower()
             return (domain, "domain") if domain else (title[:80], "title")
         if kind == "media":
-            source = self._cell_text(table, row, 2).lower()
+            source = self._cell_text(table, row, 3).lower()
             title = self._cell_text(table, row, 0).lower()
             if source and source not in {"browser", "browser-extension"}:
                 return source, "app"
             return title[:80], "title"
         if kind == "window":
-            app = self._cell_text(table, row, 3).lower()
+            app = self._cell_text(table, row, 4).lower()
             title = self._cell_text(table, row, 0).lower()
             return (app, "app") if app else (title[:80], "title")
         return "", "any"
@@ -2588,11 +2799,11 @@ class StatsDialog(QDialog):
         # ---- Overview cards ----
         web_total = float(overview_counts["web_attention"])
         web_domains = int(overview_counts["web_domain_count"])
-        self.focus_card.set_data(foreground, f"{int(overview_counts['program_count'])} programs")
-        self.web_card.set_data(web_total, f"{web_domains} domains")
-        self.video_card.set_data(video, f"{int(overview_counts['video_count'])} videos")
-        self.music_card.set_data(media, f"{int(overview_counts['music_count'])} tracks")
-        self.learning_today_card.set_data(learning_total, f"{learning_topics_count} topics")
+        self.focus_card.set_data(foreground, f"{int(overview_counts['program_count'])} 个程序")
+        self.web_card.set_data(web_total, f"{web_domains} 个域名")
+        self.video_card.set_data(video, f"{int(overview_counts['video_count'])} 条播放")
+        self.music_card.set_data(media, f"{int(overview_counts['music_count'])} 首/条")
+        self.learning_today_card.set_data(learning_total, f"{learning_topics_count} 个主题")
 
         # ---- Charts ----
         if active_overview:
@@ -2619,13 +2830,16 @@ class StatsDialog(QDialog):
             ] for r in process_rows])
 
             self._set_rows(self.window_table, [[
-                str(r["content_title"]), str(r["category"]), str(r["learning_topic"] or "-"), str(r["exe_name"]),
+                str(r["content_title"]), str(r["category"]),
+                self.storage.category_explanation(str(r["category"]), str(r["exe_name"]), str(r["content_domain"]), str(r["content_title"]), str(r["learning_topic"] or "")),
+                str(r["learning_topic"] or "-"), str(r["exe_name"]),
                 self._duration_cell(float(r["attention_seconds"] or 0)), str(r["last_seen"]),
             ] for r in win_rows])
 
         if active_web:
             self._set_rows(self.web_table, [[
                 str(r["content_title"]), str(r["content_domain"]), str(r["category"]),
+                self.storage.category_explanation(str(r["category"]), str(r["exe_name"]), str(r["content_domain"]), str(r["content_title"]), str(r["learning_topic"] or "")),
                 str(r["learning_topic"] or "-"),
                 str(r["exe_name"]), self._duration_cell(float(r["attention_seconds"] or 0)),
                 str(r["content_url"]),
@@ -2634,13 +2848,16 @@ class StatsDialog(QDialog):
         if active_video:
             self._set_rows(self.video_table, [[
                 str(r["content_title"]), str(r["content_domain"]), str(r["category"]),
+                self.storage.category_explanation(str(r["category"]), str(r["exe_name"]), str(r["content_domain"]), str(r["content_title"]), str(r["learning_topic"] or "")),
                 str(r["learning_topic"] or "-"),
                 self._duration_cell(float(r["background_seconds"] or 0)), str(r["content_url"]),
             ] for r in vp_rows])
 
         if active_music:
             self._set_rows(self.media_table, [[
-                str(r["content_title"]), str(r["category"]), str(r["exe_name"]),
+                str(r["content_title"]), str(r["category"]),
+                self.storage.category_explanation(str(r["category"]), str(r["exe_name"]), str(r["content_domain"]), str(r["content_title"]), str(r["learning_topic"] or "")),
+                str(r["exe_name"]),
                 self._duration_cell(float(r["background_seconds"] or 0)), str(r["last_seen"]),
             ] for r in mp_rows])
 
@@ -2686,8 +2903,8 @@ class StatsDialog(QDialog):
                 str(r["last_seen"]),
             ] for r in music_analysis]
             self._set_rows(self.music_analysis_table, ma_rows)
-            self.music_analysis_total.set_data(media, f"{int(overview_counts['music_count'])} tracks")
-            self.music_analysis_count.set_data(str(len(ma_rows)), "by song+artist")
+            self.music_analysis_total.set_data(media, f"{int(overview_counts['music_count'])} 首/条")
+            self.music_analysis_count.set_data(str(len(ma_rows)), "按歌曲+歌手去重")
             if ma_rows:
                 self.music_analysis_top.set_data(str(ma_rows[0][0])[:18], str(ma_rows[0][1])[:24])
 
@@ -2709,7 +2926,7 @@ class StatsDialog(QDialog):
                 str(r["item_count"]), str(r["last_seen"]),
             ] for r in learning_data]
             self._set_rows(self.learning_analysis_table, lr_rows)
-            self.learning_analysis_total.set_data(learning_total, f"{len(learning_data)} topics")
+            self.learning_analysis_total.set_data(learning_total, f"{len(learning_data)} 个主题")
 
         # ---- Goals ----
         if active_goal:
@@ -2728,7 +2945,7 @@ class StatsDialog(QDialog):
                 else:
                     st, color = "未达标", "#d95f76"
                 goal_rows.append([
-                    str(g["name"]), "at least" if g["direction"] == "min" else "max",
+                    str(g["name"]), "至少" if g["direction"] == "min" else "不超过",
                     self._duration_cell(val), self._duration_cell(target), st,
                 ])
                 goal_colors.append(color)
@@ -2797,14 +3014,21 @@ class StatsDialog(QDialog):
         except Exception:
             pass
 
+    def _export_with_error_message(self, path: str, action) -> None:
+        try:
+            action()
+        except Exception as exc:
+            show_operation_error(self, "导出失败", exc)
+            return
+        QMessageBox.information(self, "导出完成", f"已导出到：\n{path}")
+
     def export_report(self) -> None:
         start_date, end_date = self._current_date_range()
         default_name = f"usage-widget-report-{start_date.isoformat()}-{end_date.isoformat()}.html"
         path, _ = QFileDialog.getSaveFileName(self, "导出 HTML 报告", default_name, "HTML Files (*.html)")
         if not path:
             return
-        self.storage.export_html_report(Path(path), start_date, end_date)
-        QMessageBox.information(self, "导出完成", f"已导出到：\n{path}")
+        self._export_with_error_message(path, lambda: self.storage.export_html_report(Path(path), start_date, end_date))
 
     def export_music_csv(self) -> None:
         start_date, end_date = self._current_date_range()
@@ -2812,8 +3036,7 @@ class StatsDialog(QDialog):
         path, _ = QFileDialog.getSaveFileName(self, "导出音乐分析 CSV", default_name, "CSV Files (*.csv)")
         if not path:
             return
-        self.storage.export_music_csv(Path(path), start_date, end_date)
-        QMessageBox.information(self, "导出完成", f"已导出到：\n{path}")
+        self._export_with_error_message(path, lambda: self.storage.export_music_csv(Path(path), start_date, end_date))
 
     def export_learning_csv(self) -> None:
         start_date, end_date = self._current_date_range()
@@ -2821,8 +3044,7 @@ class StatsDialog(QDialog):
         path, _ = QFileDialog.getSaveFileName(self, "导出学习分析 CSV", default_name, "CSV Files (*.csv)")
         if not path:
             return
-        self.storage.export_learning_csv(Path(path), start_date, end_date)
-        QMessageBox.information(self, "导出完成", f"已导出到：\n{path}")
+        self._export_with_error_message(path, lambda: self.storage.export_learning_csv(Path(path), start_date, end_date))
 
 
 class UsageWidgetWindow(QWidget):
@@ -3096,6 +3318,7 @@ class UsageWidgetWindow(QWidget):
         button = QToolButton()
         button.setText(text)
         button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
         button.setFixedSize(34, 30)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         return button
@@ -3331,7 +3554,7 @@ class UsageWidgetWindow(QWidget):
             QLabel {{
                 color: {text};
                 letter-spacing: 0px;
-                font-family: "Microsoft YaHei UI", "Segoe UI";
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "Noto Sans CJK SC", "Segoe UI", "Arial";
             }}
             QLabel#titleLabel {{
                 font-size: 18px;
@@ -3742,6 +3965,10 @@ class UsageWidgetWindow(QWidget):
             "dingtalk": "钉钉",
         }
         display_exe = friendly_names.get(exe_name.lower(), exe_name) if exe_name else ""
+        latest_tab = self.monitor.browser_bridge.latest(max_age_seconds=30)
+        domain = str(getattr(latest_tab, "domain", "") or "") if latest_tab else ""
+        title = str(getattr(latest_tab, "title", "") or self.monitor.foreground_title or "")
+        short_hint = short_activity_hint(exe or "", domain, title, category or "")
         if category and topic:
             return f"{category} · {topic}"
         if category and category not in ("其他", "工具", "网站", "浏览器", "系统软件", "办公"):
@@ -3750,6 +3977,10 @@ class UsageWidgetWindow(QWidget):
             return category
         if topic:
             return f"学习 · {topic}"
+        if short_hint:
+            if display_exe and display_exe.lower() != short_hint.lower():
+                return f"{short_hint} · {display_exe}"
+            return short_hint
         if display_exe:
             return display_exe
         return ""
@@ -3764,6 +3995,12 @@ class UsageWidgetWindow(QWidget):
             return category
         if topic:
             return "学习"
+        latest_tab = self.monitor.browser_bridge.latest(max_age_seconds=30)
+        domain = str(getattr(latest_tab, "domain", "") or "") if latest_tab else ""
+        title = str(getattr(latest_tab, "title", "") or self.monitor.foreground_title or "")
+        short_hint = short_activity_hint(self.monitor.current_foreground_exe or "", domain, title, category or "")
+        if short_hint:
+            return short_hint
         if self.monitor.current_foreground_exe:
             return "使用中"
         return ""
@@ -4102,12 +4339,20 @@ class UsageWidgetWindow(QWidget):
         default_name = f"usage-widget-{date.today().isoformat()}.csv"
         path, _ = QFileDialog.getSaveFileName(self, "导出 CSV", default_name, "CSV Files (*.csv)")
         if path:
-            self.storage.export_csv(Path(path))
+            try:
+                self.storage.export_csv(Path(path))
+            except Exception as exc:
+                show_operation_error(self, "导出失败", exc)
+                return
             self.tray.showMessage("UsageWidget", "CSV 导出完成", build_app_icon(), 2500)
 
     def export_content_csv(self) -> None:
         default_name = f"usage-widget-content-{date.today().isoformat()}.csv"
         path, _ = QFileDialog.getSaveFileName(self, "导出内容 CSV", default_name, "CSV Files (*.csv)")
         if path:
-            self.storage.export_content_csv(Path(path))
+            try:
+                self.storage.export_content_csv(Path(path))
+            except Exception as exc:
+                show_operation_error(self, "导出失败", exc)
+                return
             self.tray.showMessage("UsageWidget", "内容 CSV 导出完成", build_app_icon(), 2500)

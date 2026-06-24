@@ -230,19 +230,19 @@ class ProcessMonitor(QObject):
         exe_l = (exe_name or "").casefold().strip()
         title_l = clean_lookup_title(domain_l, title).casefold().strip()
         if self._should_remember_domain_rule(domain_l, category):
-            self.storage.add_category_rule(domain_l, category, "domain", update_existing=False)
+            self.storage.add_category_rule(domain_l, category, "domain", update_existing=False, source="online")
             return
         if self._is_generic_content_domain(domain_l):
             if title_l and len(title_l) >= 8 and category not in BROAD_PLATFORM_CATEGORIES:
-                self.storage.add_category_rule(title_l[:120], category, "title", update_existing=False)
+                self.storage.add_category_rule(title_l[:120], category, "title", update_existing=False, source="online")
             return
         if self._is_generic_browser_process(exe_l):
             return
         if exe_l and len(exe_l) >= 3:
-            self.storage.add_category_rule(exe_l, category, "app", update_existing=False)
+            self.storage.add_category_rule(exe_l, category, "app", update_existing=False, source="online")
             return
         if title_l and len(title_l) >= 8:
-            self.storage.add_category_rule(title_l[:80], category, "title", update_existing=False)
+            self.storage.add_category_rule(title_l[:80], category, "title", update_existing=False, source="online")
 
     def _is_handwriting_context(self, settings, proc: RunningProcess | None, title: str) -> bool:
         if not settings.handwriting_mode or not proc:
@@ -404,6 +404,14 @@ class ProcessMonitor(QObject):
         if any(item in exe for item in system_apps):
             return "系统软件"
 
+        ai_priority_hints = (
+            "codex", "openai codex", "chatgpt", "openai", "claude", "gemini",
+            "deepseek", "kimi", "doubao", "copilot", "llm", "ai assistant",
+            "元宝", "豆包", "通义", "文心", "星火", "智谱",
+        )
+        if any(item in text for item in ai_priority_hints):
+            return "AI 工具"
+
         chat_hints = ("qq", "wechat", "weixin", "telegram", "discord", "slack", "whatsapp", "聊天", "消息", "群聊")
         if any(item in text for item in chat_hints):
             return "聊天"
@@ -502,7 +510,7 @@ class ProcessMonitor(QObject):
             "元宝", "yuanbao", "豆包", "通义", "tongyi", "文心", "wenxin",
             "星火", "xinghuo", "智脑", "qianwen", "百川", "baichuan",
             "chatglm", "智谱", "zhipu", "minimax", "海螺", "moonshot",
-            "阶跃星辰", "stepfun", "零一万物", "abab",
+            "阶跃星辰", "stepfun", "零一万物", "abab", "codex", "openai codex",
         )
         if any(item in text for item in ai_hints):
             return "AI 工具"
@@ -565,6 +573,10 @@ class ProcessMonitor(QObject):
         office_hints = ("office", "word", "excel", "powerpoint", "onenote", "notion", "lark", "feishu", "dingtalk", "teams", "办公", "文档", "笔记", "会议")
         if any(item in text for item in office_hints):
             return "办公"
+
+        typing_hints = ("dazidazi", "typing", "type practice", "打字", "打字练习", "键盘练习")
+        if any(item in text for item in typing_hints):
+            return "工具"
 
         video_hints = ("youtube", "bilibili", "b23.tv", "youku", "iqiyi", "video", "movie", "tv", "直播", "视频", "电影", "电视剧")
         if any(item in text for item in video_hints):

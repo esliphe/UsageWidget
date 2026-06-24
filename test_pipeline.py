@@ -1,5 +1,6 @@
 """End-to-end verification of learning video detection pipeline."""
 import sys
+from pathlib import Path
 sys.path.insert(0, ".")
 
 from usage_widget.storage import Storage
@@ -9,7 +10,11 @@ from usage_widget.learning import (
     normalize_text, LEARNING_INTENT_HINTS,
 )
 
-s = Storage()
+TEST_DB = Path("pipeline-smoke.db")
+for suffix in ("", "-shm", "-wal"):
+    Path(str(TEST_DB) + suffix).unlink(missing_ok=True)
+
+s = Storage(TEST_DB)
 m = ProcessMonitor(s)
 settings = s.load_settings()
 errors = []
@@ -95,6 +100,8 @@ check("private_title_mode OFF", not settings.private_title_mode)
 check("pause_tracking OFF", not settings.pause_tracking)
 
 s.close()
+for suffix in ("", "-shm", "-wal"):
+    Path(str(TEST_DB) + suffix).unlink(missing_ok=True)
 print(f"\n{'='*40}")
 print(f"Results: {len(errors)} errors")
 for name, actual, expected in errors:

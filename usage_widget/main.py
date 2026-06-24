@@ -3,21 +3,20 @@ from __future__ import annotations
 import sys
 import traceback
 
-from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from . import __app_name__, __version__
 from .diagnostics import log_event, log_path
 from .monitor import ProcessMonitor
 from .storage import Storage
-from .ui import UsageWidgetWindow
+from .ui import UsageWidgetWindow, apply_app_font
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(__app_name__)
     app.setApplicationVersion(__version__)
-    app.setFont(QFont("Microsoft YaHei UI", 9))
+    apply_app_font(app)
     app.setQuitOnLastWindowClosed(False)
 
     try:

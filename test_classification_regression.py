@@ -74,6 +74,12 @@ def main() -> int:
             storage.category_for("rareapp.exe", "", "Anything") == "办公",
             storage.category_for("rareapp.exe", "", "Anything"),
         )
+        explanation = storage.category_explanation("办公", "rareapp.exe", "", "Anything")
+        check(
+            "online learned rule is explained as online",
+            "来源：联网分类" in explanation,
+            explanation,
+        )
     finally:
         storage.close()
         temp_dir.cleanup()
@@ -156,6 +162,13 @@ def main() -> int:
             storage.category_for("", "bilibili.com", "普通视频") == "视频",
             storage.category_for("", "bilibili.com", "普通视频"),
         )
+        storage.add_category_rule("alpha-42", "游戏", "title", update_existing=True, source="user")
+        monitor._remember_online_category_rule("browser", "bilibili.com", "alpha-42", "学习")
+        check(
+            "online learned rule does not overwrite user correction",
+            storage.category_for("", "bilibili.com", "alpha-42") == "游戏",
+            storage.category_for("", "bilibili.com", "alpha-42"),
+        )
     finally:
         storage.close()
         temp_dir.cleanup()
@@ -233,6 +246,8 @@ def main() -> int:
             ("browser", "bilibili.com", "搞笑合集 笑到肚子疼", "娱乐"),
             ("browser", "bilibili.com", "手机开箱测评 好物推荐", "购物"),
             ("browser", "bilibili.com", "今日热点 新闻资讯", "新闻"),
+            ("Codex.exe", "", "Codex", "AI 工具"),
+            ("browser", "dazidazi.com", "在线打字练习", "工具"),
             ("browser", "music.163.com", "周杰伦 歌单", "音乐"),
             ("yuanbao.exe", "", "腾讯元宝", "AI 工具"),
             ("stm32cubemx.exe", "", "Pinout Configuration", "编程"),

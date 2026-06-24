@@ -249,6 +249,8 @@ class OnlineCategoryClassifier:
             "perplexity",
             "bolt.new",
             "lovable",
+            "codex",
+            "openai codex",
             # Chinese AI assistants (ambiguous names)
             "yuanbao",
             "元宝",

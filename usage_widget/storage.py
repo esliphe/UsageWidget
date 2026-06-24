@@ -401,6 +401,9 @@ DEFAULT_CATEGORY_RULES += [
     ("豆包", "AI 工具", "title"),
     ("kimi", "AI 工具", "title"),
     ("deepseek", "AI 工具", "title"),
+    ("codex.exe", "AI 工具", "app"),
+    ("codex", "AI 工具", "title"),
+    ("openai codex", "AI 工具", "title"),
     # Known AI tools with ambiguous names (need local rules)
     ("yuanbao", "AI 工具", "app"),
     ("元宝", "AI 工具", "title"),
@@ -447,6 +450,10 @@ DEFAULT_CATEGORY_RULES += [
     ("slack.com", "聊天", "domain"),
     ("messages.google.com", "聊天", "domain"),
     ("whatsapp.com", "聊天", "domain"),
+    ("dazidazi.com", "工具", "domain"),
+    ("dazidazi", "工具", "title"),
+    ("打字", "工具", "title"),
+    ("typing", "工具", "title"),
     ("zhihu.com", "学习", "domain"),
     ("csdn.net", "编程", "domain"),
     ("cnblogs.com", "编程", "domain"),
@@ -680,7 +687,8 @@ class Storage:
             CREATE TABLE IF NOT EXISTS category_rules (
                 pattern TEXT PRIMARY KEY,
                 category TEXT NOT NULL,
-                target TEXT NOT NULL DEFAULT 'any'
+                target TEXT NOT NULL DEFAULT 'any',
+                source TEXT NOT NULL DEFAULT 'user'
             );
 
             CREATE TABLE IF NOT EXISTS goals (
@@ -729,6 +737,12 @@ class Storage:
             "timeline_events",
             {
                 "learning_topic": "TEXT NOT NULL DEFAULT ''",
+            },
+        )
+        self._ensure_columns(
+            "category_rules",
+            {
+                "source": "TEXT NOT NULL DEFAULT 'user'",
             },
         )
         self.conn.execute(
@@ -897,11 +911,19 @@ class Storage:
 
     def _ensure_default_category_rules(self) -> None:
         self.conn.executemany(
-            "INSERT OR IGNORE INTO category_rules (pattern, category, target) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO category_rules (pattern, category, target, source) VALUES (?, ?, ?, 'default')",
             DEFAULT_CATEGORY_RULES,
         )
         self.conn.executemany(
-            "UPDATE category_rules SET category = ? WHERE pattern = ? AND target = ? AND category = ?",
+            """
+            UPDATE category_rules
+            SET source = 'default'
+            WHERE pattern = ? AND category = ? AND target = ? AND source IN ('', 'user')
+            """,
+            [(pattern, category, target) for pattern, category, target in DEFAULT_CATEGORY_RULES],
+        )
+        self.conn.executemany(
+            "UPDATE category_rules SET category = ?, source = 'default' WHERE pattern = ? AND target = ? AND category = ?",
             [
                 ("聊天", "qq.exe", "app", "社交"),
                 ("聊天", "weixin.exe", "app", "社交"),
@@ -1138,44 +1160,76 @@ class Storage:
     def category_rules(self) -> list[sqlite3.Row]:
         if self._category_rules_cache is None:
             self._category_rules_cache = self.conn.execute(
-                "SELECT pattern, category, target FROM category_rules ORDER BY category, pattern"
+                "SELECT pattern, category, target, source FROM category_rules ORDER BY category, pattern"
             ).fetchall()
         return self._category_rules_cache
 
-    def replace_category_rules(self, rules: Iterable[tuple[str, str, str]]) -> None:
+    def replace_category_rules(self, rules: Iterable[tuple[str, ...]]) -> None:
         clean = []
-        for pattern, category, target in rules:
+        default_set = {(pattern.lower(), category, target) for pattern, category, target in DEFAULT_CATEGORY_RULES}
+        target_aliases = {"标题": "title", "域名": "domain", "程序": "app", "全部": "any"}
+        source_aliases = {"本地规则": "default", "用户纠正": "user", "联网分类": "online"}
+        for rule in rules:
+            if len(rule) < 3:
+                continue
+            pattern, category, target = rule[:3]
+            source = rule[3] if len(rule) >= 4 else ""
             pattern = pattern.strip().lower()
             category = category.strip() or "其他"
-            target = target.strip() or "any"
+            target = target_aliases.get(target.strip(), target.strip()) or "any"
+            source = source_aliases.get(source.strip(), source.strip().lower()) if source else "default" if (pattern, category, target) in default_set else "user"
+            if target not in {"app", "domain", "title", "any"}:
+                target = "any"
+            if source not in {"default", "user", "online"}:
+                source = "user"
             if pattern:
-                clean.append((pattern, category, target))
+                clean.append((pattern, category, target, source))
         self.conn.execute("DELETE FROM category_rules")
         self.conn.executemany(
-            "INSERT INTO category_rules (pattern, category, target) VALUES (?, ?, ?)",
+            "INSERT INTO category_rules (pattern, category, target, source) VALUES (?, ?, ?, ?)",
             clean,
         )
         self._category_rules_cache = None
         self.conn.commit()
 
-    def add_category_rule(self, pattern: str, category: str, target: str = "any", update_existing: bool = True) -> None:
+    def add_category_rule(
+        self,
+        pattern: str,
+        category: str,
+        target: str = "any",
+        update_existing: bool = True,
+        source: str = "user",
+    ) -> None:
         pattern = pattern.strip().lower()
         category = category.strip() or "其他"
-        target = target.strip().lower() or "any"
+        target = {"标题": "title", "域名": "domain", "程序": "app", "全部": "any"}.get(target.strip(), target.strip().lower()) or "any"
+        source = {"本地规则": "default", "用户纠正": "user", "联网分类": "online"}.get(source.strip(), source.strip().lower()) or "user"
         if not pattern:
             return
         if target not in {"app", "domain", "title", "any"}:
             target = "any"
-        self.conn.execute(
-            """
-            INSERT INTO category_rules (pattern, category, target)
-            VALUES (?, ?, ?)
-            ON CONFLICT(pattern) DO UPDATE SET
-                category = excluded.category,
-                target = excluded.target
-            """,
-            (pattern, category, target),
-        )
+        if source not in {"default", "user", "online"}:
+            source = "user"
+        if source == "online" and not update_existing:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO category_rules (pattern, category, target, source)
+                VALUES (?, ?, ?, ?)
+                """,
+                (pattern, category, target, source),
+            )
+        else:
+            self.conn.execute(
+                """
+                INSERT INTO category_rules (pattern, category, target, source)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(pattern) DO UPDATE SET
+                    category = excluded.category,
+                    target = excluded.target,
+                    source = excluded.source
+                """,
+                (pattern, category, target, source),
+            )
         if update_existing:
             like = f"%{pattern}%"
             if target == "domain":
@@ -1212,15 +1266,22 @@ class Storage:
         self._category_rules_cache = None
         self.conn.commit()
 
-    def category_for(self, exe_name: str, domain: str = "", title: str = "") -> str:
+    def _category_rule_match(
+        self,
+        exe_name: str = "",
+        domain: str = "",
+        title: str = "",
+    ) -> tuple[int, int, str, str, str, str] | None:
         exe = (exe_name or "").lower()
         domain_l = (domain or "").lower()
         title_l = (title or "").lower()
-        best: tuple[int, int, str] | None = None
+        combined = f"{exe} {domain_l} {title_l}"
+        best: tuple[int, int, str, str, str, str] | None = None
         for row in self.category_rules():
             pattern = str(row["pattern"]).lower()
             target = str(row["target"])
             category = str(row["category"])
+            source = str(row["source"] or "user")
             score = 0
             if target in {"any", "title"} and title_l and pattern in title_l:
                 score = max(score, 400 + len(pattern))
@@ -1228,13 +1289,87 @@ class Storage:
                 score = max(score, 300 + len(pattern))
             if target in {"any", "app"} and exe and pattern in exe:
                 score = max(score, 250 + len(pattern))
-            if target == "any" and score == 0:
-                combined = f"{exe} {domain_l} {title_l}"
-                if pattern in combined:
-                    score = 100 + len(pattern)
+            if target == "any" and score == 0 and pattern in combined:
+                score = 100 + len(pattern)
             if score > 0 and (best is None or score > best[0]):
-                best = (score, len(pattern), category)
+                best = (score, len(pattern), category, target, pattern, source)
+        return best
+
+    def category_for(self, exe_name: str, domain: str = "", title: str = "") -> str:
+        best = self._category_rule_match(exe_name, domain, title)
         return best[2] if best else "其他"
+
+    def category_explanation(
+        self,
+        category: str,
+        exe_name: str = "",
+        domain: str = "",
+        title: str = "",
+        learning_topic: str = "",
+    ) -> str:
+        category = category or "其他"
+        if learning_topic:
+            return f"命中学习主题：{learning_topic} · 来源：学习主题识别 · 置信度：高"
+        best = self._category_rule_match(exe_name, domain, title)
+        if best and best[2] == category:
+            _score, _length, _rule_category, target, pattern, source_key = best
+            target_labels = {"title": "标题关键词", "domain": "域名", "app": "程序", "any": "综合关键词"}
+            source_labels = {"default": "本地规则", "user": "用户纠正", "online": "联网分类"}
+            source = source_labels.get(source_key, "用户纠正")
+            confidence = "高" if source_key in {"default", "user"} else "中"
+            return f"命中规则：{target_labels.get(target, target)}“{pattern}” · 来源：{source} · 置信度：{confidence}"
+        if category in {"其他", ""}:
+            return "未命中明确规则 · 来源：兜底分类 · 置信度：低"
+        if category in {"视频", "网站", "浏览器", "工具"}:
+            return f"未命中细分类 · 来源：本地兜底 · 置信度：低"
+        return f"未保存具体命中 · 来源：本地/联网分类 · 置信度：中"
+
+    def recognition_health_range(self, start_date: date, end_date: date) -> dict[str, int | float | str]:
+        start, end = start_date.isoformat(), end_date.isoformat()
+        row = self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_rows,
+                SUM(CASE WHEN kind='web_page' THEN 1 ELSE 0 END) AS web_rows,
+                SUM(CASE WHEN kind='web_page' AND content_domain != ''
+                    AND (
+                        TRIM(content_title) = ''
+                        OR lower(TRIM(content_title)) = lower(TRIM(content_domain))
+                        OR lower(TRIM(content_title)) LIKE 'http%'
+                    )
+                    THEN 1 ELSE 0 END) AS web_domain_only_rows,
+                SUM(CASE WHEN kind='video_playback' AND category = '视频' THEN 1 ELSE 0 END) AS broad_video_rows,
+                SUM(CASE WHEN category IN ('其他', '视频', '网站', '浏览器', '工具') AND learning_topic = ''
+                    THEN 1 ELSE 0 END) AS low_confidence_rows
+            FROM content_usage_daily
+            WHERE usage_date BETWEEN ? AND ?
+            """,
+            (start, end),
+        ).fetchone()
+        total = int(row["total_rows"] or 0)
+        domain_only = int(row["web_domain_only_rows"] or 0)
+        broad_video = int(row["broad_video_rows"] or 0)
+        low_conf = int(row["low_confidence_rows"] or 0)
+        if total <= 0:
+            score = 100
+        else:
+            penalty = domain_only * 8 + broad_video * 6 + low_conf * 3
+            score = max(0, min(100, int(round(100 - penalty / max(total, 1)))))
+        if score >= 85:
+            level = "良好"
+        elif score >= 65:
+            level = "一般"
+        else:
+            level = "需处理"
+        return {
+            "score": score,
+            "level": level,
+            "total_rows": total,
+            "web_rows": int(row["web_rows"] or 0),
+            "web_domain_only_rows": domain_only,
+            "broad_video_rows": broad_video,
+            "low_confidence_rows": low_conf,
+        }
 
     def add_timeline_event(
         self,
