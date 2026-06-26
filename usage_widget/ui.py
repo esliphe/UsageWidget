@@ -140,6 +140,18 @@ def quality_summary_text(quality: dict[str, int | float | str]) -> str:
 
 TARGET_LABELS = {"title": "标题", "domain": "域名", "app": "程序", "any": "全部"}
 SOURCE_LABELS = {"default": "本地规则", "user": "用户纠正", "online": "联网分类"}
+GOAL_METRIC_LABELS = {
+    "category": "分类",
+    "domain": "域名",
+    "app": "程序",
+    "learning_topic": "学习主题",
+}
+GOAL_METRIC_HELP = {
+    "category": "按内容分类统计，例如：学习、编程、视频、娱乐。",
+    "domain": "按网页域名包含匹配，例如：bilibili.com、github.com。",
+    "app": "按程序名包含匹配，例如：code.exe、chrome.exe。",
+    "learning_topic": "按学习主题统计；匹配模式留空表示全部学习主题。",
+}
 
 
 def target_label(value: str) -> str:
@@ -1157,48 +1169,116 @@ class SettingsDialog(QDialog):
         goal_panel = QFrame()
         goal_panel.setObjectName("settingsPanel")
         goal_layout = QVBoxLayout(goal_panel)
-        goal_layout.setContentsMargins(12, 12, 12, 12)
-        goal_layout.setSpacing(8)
-        goal_desc = QLabel("设置学习与使用时长目标，查看连续达标天数。指标：category=分类, domain=域名, app=程序, learning_topic=学习主题")
+        goal_layout.setContentsMargins(14, 14, 14, 14)
+        goal_layout.setSpacing(12)
+
+        goal_header = QHBoxLayout()
+        goal_title_box = QVBoxLayout()
+        goal_title_box.setSpacing(4)
+        goal_title = QLabel("目标管理")
+        goal_title.setObjectName("goalTitle")
+        goal_desc = QLabel("设置学习、娱乐、视频、应用或网站的每日时长目标。选中一行可直接回填到下方编辑器。")
+        goal_desc.setObjectName("settingsHint")
         goal_desc.setWordWrap(True)
-        goal_layout.addWidget(goal_desc)
+        goal_desc.setMaximumHeight(42)
+        goal_title_box.addWidget(goal_title)
+        goal_title_box.addWidget(goal_desc)
+        goal_header.addLayout(goal_title_box, 1)
+        self.goal_total_card = self._make_goal_summary_card("目标数", "0", "全部")
+        self.goal_enabled_card = self._make_goal_summary_card("启用", "0", "正在跟踪")
+        self.goal_limit_card = self._make_goal_summary_card("限制", "0", "不超过")
+        goal_header.addWidget(self.goal_total_card)
+        goal_header.addWidget(self.goal_enabled_card)
+        goal_header.addWidget(self.goal_limit_card)
+        goal_layout.addLayout(goal_header)
+
+        goal_tip_grid = QGridLayout()
+        goal_tip_grid.setHorizontalSpacing(8)
+        goal_tip_grid.setVerticalSpacing(8)
+        for index, metric in enumerate(("category", "learning_topic", "domain", "app")):
+            tip = QFrame()
+            tip.setObjectName("goalTip")
+            tip_layout = QVBoxLayout(tip)
+            tip_layout.setContentsMargins(9, 7, 9, 7)
+            tip_layout.setSpacing(3)
+            tip_title = QLabel(f"{metric} · {GOAL_METRIC_LABELS[metric]}")
+            tip_title.setObjectName("goalTipTitle")
+            tip_text = QLabel(GOAL_METRIC_HELP[metric])
+            tip_text.setObjectName("goalTipText")
+            tip_text.setWordWrap(True)
+            tip_layout.addWidget(tip_title)
+            tip_layout.addWidget(tip_text)
+            goal_tip_grid.addWidget(tip, index // 2, index % 2)
+        goal_layout.addLayout(goal_tip_grid)
+
         self.goal_table = QTableWidget(0, 6)
         self.goal_table.setHorizontalHeaderLabels(["目标名称", "指标类型", "匹配模式", "目标小时", "方向", "启用"])
         self.goal_table.verticalHeader().setVisible(False)
-        self.goal_table.horizontalHeader().setStretchLastSection(True)
+        self.goal_table.horizontalHeader().setStretchLastSection(False)
         self.goal_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.goal_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.goal_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.goal_table.setMaximumHeight(160)
-        self._populate_goal_table()
-        goal_layout.addWidget(self.goal_table)
-        goal_form = QHBoxLayout()
+        self.goal_table.setAlternatingRowColors(True)
+        self.goal_table.setMinimumHeight(240)
+        self.goal_table.itemSelectionChanged.connect(self._load_selected_goal)
+        goal_layout.addWidget(self.goal_table, 1)
+
+        goal_editor = QFrame()
+        goal_editor.setObjectName("goalEditor")
+        goal_form = QGridLayout(goal_editor)
+        goal_form.setContentsMargins(12, 10, 12, 10)
+        goal_form.setHorizontalSpacing(10)
+        goal_form.setVerticalSpacing(8)
         self.goal_name_input = QLineEdit()
         self.goal_name_input.setPlaceholderText("目标名称")
         self.goal_metric_combo = QComboBox()
-        self.goal_metric_combo.addItems(["category", "domain", "app", "learning_topic"])
-        self.goal_metric_combo.setMaximumWidth(120)
+        for value in ("category", "learning_topic", "domain", "app"):
+            self.goal_metric_combo.addItem(f"{GOAL_METRIC_LABELS[value]} · {value}", value)
         self.goal_pattern_input = QLineEdit()
-        self.goal_pattern_input.setPlaceholderText("匹配模式（如 学习 或留空=全部）")
+        self.goal_pattern_input.setPlaceholderText("匹配模式，例如 学习 / Python / bilibili.com；学习主题留空=全部学习")
         self.goal_target_spin = QDoubleSpinBox()
         self.goal_target_spin.setRange(0.1, 168.0)
         self.goal_target_spin.setValue(1.0)
         self.goal_target_spin.setSuffix("h")
-        self.goal_target_spin.setMaximumWidth(80)
         self.goal_direction_combo = QComboBox()
         self.goal_direction_combo.addItems(["至少", "不超过"])
-        self.goal_direction_combo.setMaximumWidth(80)
         self.goal_enabled_box = QCheckBox("启用")
         self.goal_enabled_box.setChecked(True)
         add_goal_btn = QPushButton("添加/更新")
+        add_goal_btn.setObjectName("primaryButton")
         add_goal_btn.clicked.connect(self.add_or_update_goal)
         del_goal_btn = QPushButton("删除选中")
         del_goal_btn.clicked.connect(self.delete_selected_goal)
-        for w in (self.goal_name_input, self.goal_metric_combo, self.goal_pattern_input,
-                  self.goal_target_spin, self.goal_direction_combo, self.goal_enabled_box,
-                  add_goal_btn, del_goal_btn):
-            goal_form.addWidget(w)
-        goal_layout.addLayout(goal_form)
+        clear_goal_btn = QPushButton("新建空白")
+        clear_goal_btn.clicked.connect(self.clear_goal_form)
+        self.goal_form_hint = QLabel("当前条件：分类包含“学习”时，每天至少 1.0 小时。")
+        self.goal_form_hint.setObjectName("goalFormHint")
+        self.goal_form_hint.setWordWrap(True)
+
+        goal_form.addWidget(QLabel("名称"), 0, 0)
+        goal_form.addWidget(self.goal_name_input, 0, 1, 1, 3)
+        goal_form.addWidget(QLabel("指标"), 0, 4)
+        goal_form.addWidget(self.goal_metric_combo, 0, 5)
+        goal_form.addWidget(QLabel("匹配"), 1, 0)
+        goal_form.addWidget(self.goal_pattern_input, 1, 1, 1, 3)
+        goal_form.addWidget(QLabel("目标"), 1, 4)
+        goal_form.addWidget(self.goal_target_spin, 1, 5)
+        goal_form.addWidget(QLabel("方向"), 2, 0)
+        goal_form.addWidget(self.goal_direction_combo, 2, 1)
+        goal_form.addWidget(self.goal_enabled_box, 2, 2)
+        goal_form.addWidget(self.goal_form_hint, 2, 3, 1, 3)
+        goal_form.addWidget(clear_goal_btn, 3, 3)
+        goal_form.addWidget(del_goal_btn, 3, 4)
+        goal_form.addWidget(add_goal_btn, 3, 5)
+        goal_form.setColumnStretch(1, 1)
+        goal_form.setColumnStretch(3, 1)
+        goal_layout.addWidget(goal_editor)
+        self.goal_metric_combo.currentIndexChanged.connect(self._update_goal_form_hint)
+        self.goal_pattern_input.textChanged.connect(self._update_goal_form_hint)
+        self.goal_target_spin.valueChanged.connect(self._update_goal_form_hint)
+        self.goal_direction_combo.currentIndexChanged.connect(self._update_goal_form_hint)
+        self._populate_goal_table()
+        self._update_goal_form_hint()
         self.settings_tabs.addTab(goal_panel, "学习目标")
 
         data_panel = QFrame()
@@ -1268,12 +1348,47 @@ class SettingsDialog(QDialog):
                 color: #334155;
                 padding: 9px 10px;
             }
+            QLabel#goalTitle {
+                color: #0f172a;
+                font-size: 18px;
+                font-weight: 800;
+            }
+            QFrame#goalSummaryCard {
+                background: #f8fafc;
+                border: 1px solid #d9e1ea;
+                border-radius: 8px;
+                min-width: 98px;
+            }
+            QLabel#goalSummaryTitle { color: #64748b; font-size: 11px; }
+            QLabel#goalSummaryValue { color: #0f172a; font-size: 20px; font-weight: 800; }
+            QLabel#goalSummarySub { color: #64748b; font-size: 11px; }
+            QFrame#goalTip {
+                background: #fbfdff;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+            }
+            QLabel#goalTipTitle { color: #334155; font-weight: 750; font-size: 12px; }
+            QLabel#goalTipText { color: #64748b; font-size: 11px; }
+            QFrame#goalEditor {
+                background: #f8fafc;
+                border: 1px solid #d9e1ea;
+                border-radius: 8px;
+            }
+            QLabel#goalFormHint {
+                color: #475569;
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 6px;
+                padding: 6px 8px;
+            }
             QLineEdit, QListWidget, QComboBox, QTableWidget {
                 border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px; background: white;
             }
             QPushButton { padding: 6px 10px; border: 1px solid #b9c6d4; border-radius: 6px; background: #ffffff; }
+            QPushButton#primaryButton { background: #1677d2; color: white; border-color: #1677d2; font-weight: 700; }
             QPushButton:disabled, QCheckBox:disabled { color: #94a3b8; }
             QPushButton:hover { background: #eef6ff; }
+            QPushButton#primaryButton:hover { background: #1268bb; }
             """
         )
         self._sync_privacy_dependent_controls()
@@ -1529,34 +1644,148 @@ class SettingsDialog(QDialog):
         self.settings_changed.emit()
         self.accept()
 
+    def _make_goal_summary_card(self, title: str, value: str, sub: str) -> QFrame:
+        card = QFrame()
+        card.setObjectName("goalSummaryCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(2)
+        title_label = QLabel(title)
+        title_label.setObjectName("goalSummaryTitle")
+        value_label = QLabel(value)
+        value_label.setObjectName("goalSummaryValue")
+        sub_label = QLabel(sub)
+        sub_label.setObjectName("goalSummarySub")
+        layout.addWidget(title_label)
+        layout.addWidget(value_label)
+        layout.addWidget(sub_label)
+        card.value_label = value_label  # type: ignore[attr-defined]
+        card.sub_label = sub_label  # type: ignore[attr-defined]
+        return card
+
+    def _set_goal_summary_card(self, card: QFrame, value: object, sub: str) -> None:
+        if hasattr(card, "value_label"):
+            card.value_label.setText(str(value))  # type: ignore[attr-defined]
+        if hasattr(card, "sub_label"):
+            card.sub_label.setText(sub)  # type: ignore[attr-defined]
+
+    def _goal_metric_label(self, metric: str) -> str:
+        return GOAL_METRIC_LABELS.get(metric, metric or "分类")
+
+    def _goal_metric_index(self, metric: str) -> int:
+        index = self.goal_metric_combo.findData(metric)
+        return index if index >= 0 else 0
+
+    def _update_goal_summary(self) -> None:
+        rows = self.storage.goal_rows_all()
+        total = len(rows)
+        enabled = sum(1 for row in rows if int(row["enabled"]))
+        max_count = sum(1 for row in rows if str(row["direction"]) == "max")
+        min_count = total - max_count
+        self._set_goal_summary_card(self.goal_total_card, total, f"{min_count} 个至少目标")
+        self._set_goal_summary_card(self.goal_enabled_card, enabled, f"{total - enabled} 个暂停")
+        self._set_goal_summary_card(self.goal_limit_card, max_count, "控制娱乐/视频等上限")
+
     def _populate_goal_table(self) -> None:
+        previous = self.goal_table.currentRow()
+        self.goal_table.blockSignals(True)
         self.goal_table.setRowCount(0)
         for row_data in self.storage.goal_rows_all():
             self._add_goal_row(row_data)
+        self.goal_table.blockSignals(False)
+        if self.goal_table.rowCount() > 0:
+            self.goal_table.selectRow(max(0, min(previous, self.goal_table.rowCount() - 1)))
+        self._update_goal_summary()
 
     def _add_goal_row(self, row_data) -> None:
         r = self.goal_table.rowCount()
         self.goal_table.insertRow(r)
-        self.goal_table.setItem(r, 0, QTableWidgetItem(str(row_data["name"])))
-        self.goal_table.setItem(r, 1, QTableWidgetItem(str(row_data["metric"])))
-        self.goal_table.setItem(r, 2, QTableWidgetItem(str(row_data["pattern"])))
+        enabled = int(row_data["enabled"])
+        name_item = QTableWidgetItem(str(row_data["name"]))
+        metric = str(row_data["metric"])
+        metric_item = QTableWidgetItem(f"{self._goal_metric_label(metric)} · {metric}")
+        metric_item.setData(Qt.ItemDataRole.UserRole, metric)
+        pattern = str(row_data["pattern"])
+        pattern_item = QTableWidgetItem(pattern if pattern else "全部")
         hours = float(row_data["target_seconds"]) / 3600.0
-        self.goal_table.setItem(r, 3, QTableWidgetItem(f"{hours:.1f}"))
+        hour_item = QTableWidgetItem(f"{hours:.1f}")
         direction_text = "至少" if str(row_data["direction"]) == "min" else "不超过"
-        self.goal_table.setItem(r, 4, QTableWidgetItem(direction_text))
-        self.goal_table.setItem(r, 5, QTableWidgetItem("是" if int(row_data["enabled"]) else "否"))
+        direction_item = QTableWidgetItem(direction_text)
+        enabled_item = QTableWidgetItem("是" if enabled else "否")
+        for item in (name_item, metric_item, pattern_item, hour_item, direction_item, enabled_item):
+            if not enabled:
+                item.setForeground(QBrush(QColor("#94a3b8")))
+        self.goal_table.setItem(r, 0, name_item)
+        self.goal_table.setItem(r, 1, metric_item)
+        self.goal_table.setItem(r, 2, pattern_item)
+        self.goal_table.setItem(r, 3, hour_item)
+        self.goal_table.setItem(r, 4, direction_item)
+        self.goal_table.setItem(r, 5, enabled_item)
+
+    def _load_selected_goal(self) -> None:
+        row = self.goal_table.currentRow()
+        if row < 0:
+            return
+        name_item = self.goal_table.item(row, 0)
+        metric_item = self.goal_table.item(row, 1)
+        pattern_item = self.goal_table.item(row, 2)
+        hours_item = self.goal_table.item(row, 3)
+        direction_item = self.goal_table.item(row, 4)
+        enabled_item = self.goal_table.item(row, 5)
+        self.goal_name_input.setText(name_item.text() if name_item else "")
+        metric = str(metric_item.data(Qt.ItemDataRole.UserRole) if metric_item else "category")
+        self.goal_metric_combo.setCurrentIndex(self._goal_metric_index(metric))
+        pattern = pattern_item.text() if pattern_item else ""
+        self.goal_pattern_input.setText("" if pattern == "全部" else pattern)
+        try:
+            self.goal_target_spin.setValue(float(hours_item.text()) if hours_item else 1.0)
+        except ValueError:
+            self.goal_target_spin.setValue(1.0)
+        self.goal_direction_combo.setCurrentText(direction_item.text() if direction_item else "至少")
+        self.goal_enabled_box.setChecked((enabled_item.text() if enabled_item else "是") == "是")
+        self._update_goal_form_hint()
+
+    def clear_goal_form(self) -> None:
+        self.goal_table.clearSelection()
+        self.goal_name_input.clear()
+        self.goal_metric_combo.setCurrentIndex(self._goal_metric_index("category"))
+        self.goal_pattern_input.clear()
+        self.goal_target_spin.setValue(1.0)
+        self.goal_direction_combo.setCurrentText("至少")
+        self.goal_enabled_box.setChecked(True)
+        self.goal_name_input.setFocus()
+        self._update_goal_form_hint()
+
+    def _update_goal_form_hint(self) -> None:
+        if not hasattr(self, "goal_form_hint"):
+            return
+        metric = str(self.goal_metric_combo.currentData() or "category")
+        metric_label = self._goal_metric_label(metric)
+        pattern = self.goal_pattern_input.text().strip()
+        target = self.goal_target_spin.value()
+        direction = str(self.goal_direction_combo.currentText())
+        scope = f"{metric_label}包含“{pattern}”" if pattern else ("全部学习主题" if metric == "learning_topic" else f"全部{metric_label}")
+        self.goal_form_hint.setText(f"当前条件：{scope}时，每天{direction} {target:.1f} 小时。")
+
+    def _select_goal_by_name(self, name: str) -> None:
+        for row in range(self.goal_table.rowCount()):
+            item = self.goal_table.item(row, 0)
+            if item and item.text() == name:
+                self.goal_table.selectRow(row)
+                return
 
     def add_or_update_goal(self) -> None:
         name = self.goal_name_input.text().strip()
         if not name:
             return
-        metric = str(self.goal_metric_combo.currentText())
+        metric = str(self.goal_metric_combo.currentData() or self.goal_metric_combo.currentText())
         pattern = self.goal_pattern_input.text().strip()
         target_hours = self.goal_target_spin.value()
         direction = "min" if str(self.goal_direction_combo.currentText()) == "至少" else "max"
         enabled = 1 if self.goal_enabled_box.isChecked() else 0
         self.storage.upsert_goal(name, metric, pattern, target_hours * 3600, direction, enabled)
         self._populate_goal_table()
+        self._select_goal_by_name(name)
         self.data_changed.emit()
 
     def delete_selected_goal(self) -> None:
