@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QEvent, QFileInfo, QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QMouseEvent, QPainter, QPixmap
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -2060,6 +2060,8 @@ class StatsDialog(QDialog):
         self.compare_label.setObjectName("compareLabel")
         self.compare_label.setWordWrap(True)
         root.addWidget(self.compare_label)
+        self.data_tools = self._make_data_tools()
+        root.addWidget(self.data_tools)
 
         self.tabs = QTabWidget()
         self.overview_tab = self._make_overview_tab()
@@ -2181,6 +2183,42 @@ class StatsDialog(QDialog):
                 color: #334155;
                 padding: 7px 10px;
                 font-weight: 650;
+            }
+            QFrame#dataTools {
+                background: #ffffff;
+                border: 1px solid #d9e1ea;
+                border-radius: 8px;
+            }
+            QLabel#dataToolsTitle {
+                color: #334155;
+                font-weight: 750;
+                padding-right: 4px;
+            }
+            QLabel#dataScopeLabel {
+                background: #eef6ff;
+                border: 1px solid #cfe4ff;
+                border-radius: 6px;
+                color: #1d4ed8;
+                font-size: 12px;
+                font-weight: 700;
+                padding: 5px 8px;
+            }
+            QLabel#dataFilterStatus {
+                color: #607089;
+                font-size: 12px;
+                min-width: 128px;
+            }
+            QLineEdit {
+                padding: 6px 9px;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                background: #ffffff;
+            }
+            QLineEdit:focus {
+                border-color: #1677d2;
+            }
+            QComboBox:disabled, QCheckBox:disabled {
+                color: #94a3b8;
             }
             QLabel#timelineHint {
                 color: #607089;
@@ -2415,6 +2453,49 @@ class StatsDialog(QDialog):
         layout.addWidget(self.timeline_table, 1)
         return tab
 
+    def _make_data_tools(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("dataTools")
+        panel.setVisible(False)
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
+
+        title = QLabel("数据视图")
+        title.setObjectName("dataToolsTitle")
+        self.data_search_input = QLineEdit()
+        self.data_search_input.setPlaceholderText("搜索当前表格：标题 / 域名 / 程序 / 分类")
+        self.data_search_input.setClearButtonEnabled(True)
+        self.data_search_input.textChanged.connect(self._apply_data_filters)
+
+        self.data_scope_label = QLabel("当前页")
+        self.data_scope_label.setObjectName("dataScopeLabel")
+
+        self.data_category_filter = QComboBox()
+        for item in ("全部分类", "学习", "编程", "AI 工具", "系统软件", "聊天", "游戏", "视频", "音乐", "娱乐", "社交", "办公", "工具", "网站", "购物", "新闻", "其他"):
+            self.data_category_filter.addItem(item, "" if item == "全部分类" else item)
+        self.data_category_filter.currentIndexChanged.connect(self._apply_data_filters)
+
+        self.low_confidence_only_box = QCheckBox("低置信")
+        self.low_confidence_only_box.setToolTip("只显示分类依据为低置信、兜底分类，或仍停留在宽泛分类的行")
+        self.low_confidence_only_box.toggled.connect(self._apply_data_filters)
+
+        clear_button = QPushButton("清空")
+        clear_button.setToolTip("清空搜索、分类和低置信筛选")
+        clear_button.clicked.connect(self._clear_data_filters)
+
+        self.data_filter_status = QLabel("显示 0/0")
+        self.data_filter_status.setObjectName("dataFilterStatus")
+
+        layout.addWidget(title)
+        layout.addWidget(self.data_scope_label)
+        layout.addWidget(self.data_search_input, 1)
+        layout.addWidget(self.data_category_filter)
+        layout.addWidget(self.low_confidence_only_box)
+        layout.addWidget(clear_button)
+        layout.addWidget(self.data_filter_status)
+        return panel
+
     def _make_table(self, headers: list[str], sort_column: int | None = None) -> QTableWidget:
         table = QTableWidget(0, len(headers))
         table.setHorizontalHeaderLabels(headers)
@@ -2430,7 +2511,209 @@ class StatsDialog(QDialog):
         table.horizontalHeader().setStretchLastSection(True)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         table.horizontalHeader().setDefaultSectionSize(150)
+        table.setShowGrid(False)
+        table.setStyleSheet(
+            """
+            QTableWidget {
+                background: #ffffff;
+                border: 1px solid #d9e1ea;
+                border-radius: 8px;
+                selection-background-color: #dbeafe;
+                selection-color: #0f172a;
+            }
+            QTableWidget::item {
+                border-bottom: 1px solid #edf2f7;
+                padding-left: 4px;
+                padding-right: 4px;
+            }
+            """
+        )
         return table
+
+    def _clear_data_filters(self) -> None:
+        self.data_search_input.clear()
+        self.data_category_filter.setCurrentIndex(0)
+        self.low_confidence_only_box.setChecked(False)
+        self._apply_data_filters()
+
+    def _current_data_tables(self) -> list[QTableWidget]:
+        if not hasattr(self, "tabs"):
+            return []
+        active = self.tabs.currentWidget()
+        if active is self.programs_tab:
+            return [self.process_table, self.window_table]
+        if active is self.web_tab:
+            return [self.web_table, self.domain_table]
+        if active is self.video_tab:
+            return [self.video_table, self.video_domain_table]
+        if active is self.music_tab:
+            return [self.media_table, self.music_analysis_table, self.artist_analysis_table]
+        if active is self.learning_analysis_tab:
+            return [self.learning_analysis_table]
+        if active is self.category_table:
+            return [self.category_table]
+        if active is self.goal_table:
+            return [self.goal_table]
+        if self._is_timeline_tab_active():
+            return [self.timeline_table]
+        return []
+
+    def _header_texts(self, table: QTableWidget) -> list[str]:
+        values = []
+        for col in range(table.columnCount()):
+            item = table.horizontalHeaderItem(col)
+            values.append(item.text().strip() if item else "")
+        return values
+
+    def _category_column(self, table: QTableWidget) -> int:
+        for index, header in enumerate(self._header_texts(table)):
+            if header in {"内容分类", "分类", "主要分类"}:
+                return index
+        return -1
+
+    def _classification_column(self, table: QTableWidget) -> int:
+        for index, header in enumerate(self._header_texts(table)):
+            if header == "分类依据":
+                return index
+        return -1
+
+    def _row_text(self, table: QTableWidget, row: int) -> str:
+        parts = []
+        for col in range(table.columnCount()):
+            item = table.item(row, col)
+            if item:
+                parts.append(item.text())
+        return " ".join(parts)
+
+    def _row_is_low_confidence(self, table: QTableWidget, row: int, category_col: int, reason_col: int) -> bool:
+        reason = table.item(row, reason_col).text() if reason_col >= 0 and table.item(row, reason_col) else ""
+        if "置信度：低" in reason or "未命中细分类" in reason or "兜底分类" in reason:
+            return True
+        if category_col >= 0:
+            item = table.item(row, category_col)
+            category = item.text().strip() if item else ""
+            return category in {"其他", "视频", "网站", "浏览器", "工具"}
+        return False
+
+    def _decorate_data_table(self, table: QTableWidget) -> None:
+        category_col = self._category_column(table)
+        reason_col = self._classification_column(table)
+        if category_col < 0 and reason_col < 0:
+            return
+        category_colors = {
+            "学习": "#14532d",
+            "编程": "#075985",
+            "AI 工具": "#5b21b6",
+            "游戏": "#7c2d12",
+            "音乐": "#9d174d",
+            "娱乐": "#854d0e",
+            "聊天": "#155e75",
+            "办公": "#334155",
+            "系统软件": "#475569",
+        }
+        for row in range(table.rowCount()):
+            reason = table.item(row, reason_col).text() if reason_col >= 0 and table.item(row, reason_col) else ""
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                if item:
+                    item.setBackground(QBrush())
+                    item.setForeground(QBrush())
+            background = None
+            if self._row_is_low_confidence(table, row, category_col, reason_col):
+                background = QColor("#fff7ed")
+            if "来源：用户纠正" in reason:
+                background = QColor("#ecfdf5")
+            elif "来源：联网分类" in reason:
+                background = QColor("#eff6ff")
+            elif "来源：学习主题识别" in reason:
+                background = QColor("#f0fdf4")
+            if background is not None:
+                for col in range(table.columnCount()):
+                    item = table.item(row, col)
+                    if item:
+                        item.setBackground(QBrush(background))
+            if category_col >= 0:
+                item = table.item(row, category_col)
+                if item:
+                    color = category_colors.get(item.text().strip())
+                    if color:
+                        item.setForeground(QBrush(QColor(color)))
+            if reason_col >= 0:
+                item = table.item(row, reason_col)
+                if item:
+                    if "置信度：低" in reason or "兜底分类" in reason:
+                        item.setForeground(QBrush(QColor("#b45309")))
+                    elif "来源：用户纠正" in reason:
+                        item.setForeground(QBrush(QColor("#047857")))
+                    elif "来源：联网分类" in reason:
+                        item.setForeground(QBrush(QColor("#1d4ed8")))
+
+    def _data_filter_capabilities(self, tables: list[QTableWidget]) -> tuple[bool, bool]:
+        has_category = any(self._category_column(table) >= 0 for table in tables)
+        has_reason = any(self._classification_column(table) >= 0 for table in tables)
+        return has_category, has_reason
+
+    def _update_data_tools_for_tab(self) -> None:
+        tables = self._current_data_tables()
+        self.data_tools.setVisible(bool(tables))
+        if hasattr(self, "data_scope_label") and hasattr(self, "tabs"):
+            self.data_scope_label.setText(self.tabs.tabText(self.tabs.currentIndex()))
+        has_category, has_reason = self._data_filter_capabilities(tables)
+        self.data_category_filter.setEnabled(has_category)
+        self.low_confidence_only_box.setEnabled(has_category or has_reason)
+        if not has_category and self.data_category_filter.currentIndex() != 0:
+            self.data_category_filter.blockSignals(True)
+            self.data_category_filter.setCurrentIndex(0)
+            self.data_category_filter.blockSignals(False)
+        if not (has_category or has_reason) and self.low_confidence_only_box.isChecked():
+            self.low_confidence_only_box.blockSignals(True)
+            self.low_confidence_only_box.setChecked(False)
+            self.low_confidence_only_box.blockSignals(False)
+        self._apply_data_filters()
+
+    def _apply_data_filters(self) -> None:
+        if not hasattr(self, "data_search_input"):
+            return
+        tables = self._current_data_tables()
+        has_category, has_reason = self._data_filter_capabilities(tables)
+        query = self.data_search_input.text().strip().casefold()
+        category_filter = str(self.data_category_filter.currentData() or "") if has_category else ""
+        low_only = self.low_confidence_only_box.isChecked() if (has_category or has_reason) else False
+        visible_total = 0
+        row_total = 0
+        for table in tables:
+            self._decorate_data_table(table)
+            category_col = self._category_column(table)
+            reason_col = self._classification_column(table)
+            table.setUpdatesEnabled(False)
+            try:
+                for row in range(table.rowCount()):
+                    row_total += 1
+                    row_text = self._row_text(table, row).casefold()
+                    category_text = ""
+                    if category_col >= 0 and table.item(row, category_col):
+                        category_text = table.item(row, category_col).text().strip()
+                    matches_query = not query or query in row_text
+                    matches_category = not category_filter or (category_col >= 0 and category_text == category_filter)
+                    matches_confidence = not low_only or self._row_is_low_confidence(table, row, category_col, reason_col)
+                    visible = matches_query and matches_category and matches_confidence
+                    table.setRowHidden(row, not visible)
+                    if visible:
+                        visible_total += 1
+            finally:
+                table.setUpdatesEnabled(True)
+        if tables:
+            active_filters = []
+            if query:
+                active_filters.append("搜索")
+            if category_filter:
+                active_filters.append("分类")
+            if low_only:
+                active_filters.append("低置信")
+            suffix = f" · {'/'.join(active_filters)}" if active_filters else ""
+            self.data_filter_status.setText(f"{len(tables)} 表 · 显示 {visible_total}/{row_total}{suffix}")
+        else:
+            self.data_filter_status.setText("显示 0/0")
 
     @staticmethod
     def _make_merged_tab(title1: str, table1: QTableWidget, title2: str, table2: QTableWidget) -> QWidget:
@@ -2653,6 +2936,7 @@ class StatsDialog(QDialog):
         return self.tabs.currentWidget() is self.timeline_tab
 
     def _on_tab_changed(self, _index: int) -> None:
+        self._update_data_tools_for_tab()
         QTimer.singleShot(0, self.refresh)
 
     def _load_more_timeline(self) -> None:
@@ -2722,6 +3006,7 @@ class StatsDialog(QDialog):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             self._do_refresh()
+            self._update_data_tools_for_tab()
         finally:
             QApplication.restoreOverrideCursor()
             if hasattr(self, "refresh_button"):
