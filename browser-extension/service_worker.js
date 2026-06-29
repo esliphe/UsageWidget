@@ -1,13 +1,43 @@
 const ENDPOINT = "http://127.0.0.1:47621/active-tab";
 const AUDIBLE_ENDPOINT = "http://127.0.0.1:47621/audible-tabs";
 const PAGE_SIGNAL_ENDPOINT = "http://127.0.0.1:47621/page-signal";
+const SESSION_ENDPOINT = "http://127.0.0.1:47621/session";
+
+let authToken = "";
+
+async function refreshAuthToken() {
+  const response = await fetch(SESSION_ENDPOINT, {
+    method: "GET",
+    cache: "no-store"
+  });
+  if (!response.ok) {
+    throw new Error(`session failed: ${response.status}`);
+  }
+  const payload = await response.json();
+  authToken = String(payload.token || "");
+  if (!authToken) {
+    throw new Error("empty session token");
+  }
+  return authToken;
+}
 
 async function postJson(endpoint, payload) {
-  await fetch(endpoint, {
+  if (!authToken) {
+    await refreshAuthToken();
+  }
+  const response = await fetch(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-UsageWidget-Token": authToken },
     body: JSON.stringify(payload)
   });
+  if (response.status === 401 || response.status === 403) {
+    await refreshAuthToken();
+    await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-UsageWidget-Token": authToken },
+      body: JSON.stringify(payload)
+    });
+  }
 }
 
 async function sendActiveTab() {

@@ -139,6 +139,8 @@ class RunningProcess:
 
 class ProcessMonitor(QObject):
     updated = Signal()
+    MAX_SAMPLE_DELTA_SECONDS = 300.0
+    MEDIA_FALLBACK_ERROR_THRESHOLD = 3
 
     def __init__(self, storage: Storage, interval_ms: int = 1500, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -168,6 +170,7 @@ class ProcessMonitor(QObject):
         self.current_category: str = ""
         self.current_foreground_exe: str = ""
         self._last_sample: datetime | None = None
+        self._sampling = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.sample)
 
@@ -377,8 +380,11 @@ class ProcessMonitor(QObject):
         try:
             if learning_topic and should_mark_learning(category, learning_topic, domain, title, kind):
                 return "学习"
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event(
+                f"学习分类判定失败: {type(exc).__name__}: category={category} topic={learning_topic} "
+                f"domain={domain} title={str(title)[:80]} kind={kind}: {exc}"
+            )
         return category
 
     def _fallback_category_for(self, exe_name: str, domain: str = "", title: str = "") -> str:
@@ -662,9 +668,17 @@ class ProcessMonitor(QObject):
         _song, _artist, label = parse_music_identity(title, source=source, domain=domain)
         return label or title
 
+    def _latest_browser_tab(self, settings):
+        if not settings.track_browser_urls:
+            return None
+        try:
+            return self.browser_bridge.latest()
+        except Exception as exc:
+            log_event(f"读取浏览器当前标签失败: {type(exc).__name__}: {exc}")
+            return None
+
     def start(self) -> None:
         self.browser_bridge.start()
-        self._last_sample = datetime.now()
         self.sample(write=False)
         self._timer.start(self.interval_ms)
 
@@ -672,15 +686,35 @@ class ProcessMonitor(QObject):
         self._timer.stop()
         self.browser_bridge.stop()
 
-    def sample(self, write: bool = True) -> None:
-        sample_started = time.perf_counter()
-        now = datetime.now()
+    def _sample_delta(self, now: datetime, write: bool) -> float:
         if self._last_sample is None:
-            delta = self.interval_ms / 1000.0
-        else:
-            delta = (now - self._last_sample).total_seconds()
+            self._last_sample = now
+            return 0.0
+        observed = max(0.0, (now - self._last_sample).total_seconds())
         self._last_sample = now
-        delta = max(0.2, min(delta, 5.0))
+        if not write:
+            return 0.0
+        if observed > self.MAX_SAMPLE_DELTA_SECONDS:
+            log_event(
+                f"采样间隔过长，按 {self.MAX_SAMPLE_DELTA_SECONDS:.0f}s 计入：observed={observed:.1f}s"
+            )
+            return self.MAX_SAMPLE_DELTA_SECONDS
+        return observed
+
+    def sample(self, write: bool = True) -> None:
+        if self._sampling:
+            log_event("采样仍在执行，跳过本次定时器触发")
+            return
+        self._sampling = True
+        sample_started = time.perf_counter()
+        try:
+            self._sample_impl(write=write, sample_started=sample_started)
+        finally:
+            self._sampling = False
+
+    def _sample_impl(self, write: bool, sample_started: float) -> None:
+        now = datetime.now()
+        delta = self._sample_delta(now, write)
 
         ignored = set(self.storage.ignored_processes())
         groups: dict[str, RunningProcess] = {}
@@ -725,10 +759,16 @@ class ProcessMonitor(QObject):
         self.current_foreground_exe = ""
 
         settings = self.storage.load_settings()
-        audible_tabs = self.browser_bridge.audible_tabs() if settings.track_browser_urls else []
+        audible_tabs = []
+        if settings.track_browser_urls:
+            try:
+                audible_tabs = self.browser_bridge.audible_tabs()
+            except Exception as exc:
+                log_event(f"读取浏览器音频标签失败: {type(exc).__name__}: {exc}")
         if settings.track_media_sessions:
-            self.media_provider.refresh_async()
-        media_items = self.media_provider.current_items()
+            media_items = self.media_provider.refresh_sync(timeout_seconds=0.8)
+        else:
+            media_items = self.media_provider.current_items()
         media_activity = bool(audible_tabs or media_items)
         foreground_proc = groups.get(fg_path) if fg_path else None
         handwriting_context = self._is_handwriting_context(settings, foreground_proc, fg_title)
@@ -755,13 +795,13 @@ class ProcessMonitor(QObject):
                     {
                         "exe_name": proc.exe_name,
                         "exe_path": proc.exe_path,
-                        "running_seconds": delta * max(1, proc.instance_count),
+                        "running_seconds": delta,
                         "foreground_seconds": delta if should_count_attention and key == fg_path else 0.0,
                     }
                 )
             if settings.track_window_titles and should_count_attention and fg_path and fg_path in groups and fg_title:
                 proc = groups[fg_path]
-                tab = self.browser_bridge.latest() if settings.track_browser_urls else None
+                tab = self._latest_browser_tab(settings)
                 title = tab.title if tab and tab.title else fg_title
                 url = tab.url if tab else ""
                 content = classify_window_content(
@@ -922,7 +962,7 @@ class ProcessMonitor(QObject):
                     content_url = ""
                     content_domain = ""
                     if is_browser_media:
-                        latest_tab = self.browser_bridge.latest() if settings.track_browser_urls else None
+                        latest_tab = self._latest_browser_tab(settings)
                         if latest_tab:
                             browser_kind = self._browser_playback_kind(latest_tab)
                             if browser_kind == "muted":
@@ -990,7 +1030,11 @@ class ProcessMonitor(QObject):
                 self.current_media_titles = media_titles[:3]
                 if fallback_video_titles and not self.current_video_titles:
                     self.current_video_titles = fallback_video_titles[:3]
-                if not media_items and not audible_tabs and self.media_provider.consecutive_errors > 0:
+                if (
+                    not media_items
+                    and not audible_tabs
+                    and self.media_provider.consecutive_errors >= self.MEDIA_FALLBACK_ERROR_THRESHOLD
+                ):
                     for proc in self._known_music_processes(groups):
                         display_title = f"{friendly_source_name(proc.exe_name)}（后台播放兜底）"
                         category = self._category_for(proc.exe_name, "", display_title, settings)

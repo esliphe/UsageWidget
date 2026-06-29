@@ -9,11 +9,13 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QEvent, QFileInfo, QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QMouseEvent, QPainter, QPixmap
+from PySide6.QtCore import QDate, QEasingCurve, QEvent, QFileInfo, QPoint, QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QKeySequence, QMouseEvent, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractSpinBox,
     QAbstractItemView,
+    QCalendarWidget,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -44,21 +46,49 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
 
 from . import __version__
-from .diagnostics import clear_log, log_path, read_recent_log
+from .diagnostics import clear_log, log_event, log_path, read_recent_log
 from .monitor import ProcessMonitor, RunningProcess
 from .startup import is_startup_enabled, set_startup_enabled
 from .storage import AppSettings, DEFAULT_CATEGORY_RULES, DEFAULT_IGNORED, Storage
 from .timefmt import format_duration, format_duration_long, format_duration_smart
+from .ui_palette import app_color, category_color
+from .ui_helpers import (
+    GOAL_METRIC_HELP,
+    GOAL_METRIC_LABELS,
+    cleanup_rule_title,
+    data_definition_text,
+    is_generic_content_domain,
+    learning_feature_state,
+    low_info_web_hint,
+    online_feature_state,
+    quality_summary_text,
+    short_activity_hint,
+    source_label,
+    target_label,
+)
+from .ui_widgets import (
+    DonutChartWidget,
+    GroupedBarChartWidget,
+    HeatmapWidget,
+    HourlyActivityChart,
+    ProcessRow,
+    SortableTableItem,
+    StatCard,
+)
 
 
 FULL_SIZE = (400, 520)
 COLLAPSED_SIZE = (500, 118)
+MAX_ICON_CACHE_SIZE = 200
+_APP_ICON_CACHE: QIcon | None = None
 UI_FONT_CANDIDATES = (
+    "Noto Sans SC",
     "Microsoft YaHei UI",
     "Microsoft YaHei",
     "SimSun",
@@ -67,15 +97,30 @@ UI_FONT_CANDIDATES = (
     "Segoe UI",
     "Arial",
 )
-GENERIC_CONTENT_DOMAIN_HINTS = (
-    "bilibili.com",
-    "youtube.com",
-    "douyin.com",
-    "kuaishou.com",
-    "xiaohongshu.com",
-    "weibo.com",
-    "zhihu.com",
+COMMON_CATEGORY_CHOICES = (
+    "学习",
+    "编程",
+    "AI 工具",
+    "系统软件",
+    "聊天",
+    "游戏",
+    "视频",
+    "音乐",
+    "娱乐",
+    "社交",
+    "办公",
+    "工具",
+    "网站",
+    "购物",
+    "新闻",
+    "其他",
 )
+TARGET_EXPLANATIONS = {
+    "title": "标题",
+    "domain": "域名",
+    "app": "程序",
+    "any": "全部",
+}
 
 
 def ui_font_family() -> str:
@@ -96,96 +141,63 @@ def ui_font_family() -> str:
     return "Microsoft YaHei UI"
 
 
+def load_bundled_fonts() -> list[str]:
+    loaded: list[str] = []
+    roots = [Path(__file__).resolve().parent.parent / "fonts"]
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent if getattr(sys, "frozen", False) else ""))
+    if bundle_root:
+        roots.extend([bundle_root / "fonts", bundle_root / "assets" / "fonts"])
+    for root in roots:
+        if not root.exists():
+            continue
+        for pattern in ("*.ttf", "*.otf", "*.ttc"):
+            for font_path in root.glob(pattern):
+                try:
+                    font_id = QFontDatabase.addApplicationFont(str(font_path))
+                    if font_id >= 0:
+                        loaded.extend(QFontDatabase.applicationFontFamilies(font_id))
+                except Exception:
+                    pass
+    return loaded
+
+
+def ui_font_status_text() -> str:
+    try:
+        families = QFontDatabase.families()
+    except Exception as exc:
+        return f"字体库不可读：{exc}"
+    available = {family.casefold(): family for family in families}
+    for family in UI_FONT_CANDIDATES:
+        matched = available.get(family.casefold())
+        if matched:
+            return f"{matched}（可用字体 {len(families)} 个）"
+    fallback = QApplication.font().family()
+    return f"未找到常见中文字体，当前回退为 {fallback or 'Qt 默认字体'}（可用字体 {len(families)} 个）"
+
+
 def ui_font_stack() -> str:
     return ", ".join(f'"{family}"' for family in UI_FONT_CANDIDATES)
 
 
 def apply_app_font(app: QApplication) -> None:
-    app.setFont(QFont(ui_font_family(), 9))
-
-
-def learning_feature_state(settings: AppSettings) -> str:
-    if settings.private_title_mode:
-        return "本地开启；联网增强关闭（隐私模式）"
-    if settings.online_category_lookup:
-        return "本地开启；联网增强开启"
-    return "本地开启；联网增强关闭"
+    loaded = load_bundled_fonts()
+    family = ui_font_family()
+    app.setFont(QFont(family, 9))
+    try:
+        bundled = f"；已加载随包字体：{', '.join(loaded)}" if loaded else ""
+        log_event(f"UI 字体：{ui_font_status_text()}{bundled}")
+    except Exception:
+        pass
 
 
 def show_operation_error(parent: QWidget | None, title: str, exc: Exception) -> None:
     QMessageBox.critical(parent, title, f"操作失败：\n{exc}\n\n可在运行诊断中查看日志路径。")
 
 
-def is_generic_content_domain(domain: str) -> bool:
-    lowered = domain.casefold()
-    return any(hint in lowered for hint in GENERIC_CONTENT_DOMAIN_HINTS)
-
-
-def cleanup_rule_title(title: str) -> str:
-    value = title.strip()
-    for suffix in (" - 哔哩哔哩", "_哔哩哔哩_bilibili", " - bilibili", " - YouTube"):
-        if value.endswith(suffix):
-            value = value[: -len(suffix)].strip()
-    return value[:80]
-
-
-def quality_summary_text(quality: dict[str, int | float | str]) -> str:
-    return (
-        f"{quality.get('score', 100)}/100 · {quality.get('level', '良好')} · "
-        f"仅域名 {quality.get('web_domain_only_rows', 0)} · "
-        f"泛视频 {quality.get('broad_video_rows', 0)} · "
-        f"低置信 {quality.get('low_confidence_rows', 0)}"
-    )
-
-
-TARGET_LABELS = {"title": "标题", "domain": "域名", "app": "程序", "any": "全部"}
-SOURCE_LABELS = {"default": "本地规则", "user": "用户纠正", "online": "联网分类"}
-GOAL_METRIC_LABELS = {
-    "category": "分类",
-    "domain": "域名",
-    "app": "程序",
-    "learning_topic": "学习主题",
-}
-GOAL_METRIC_HELP = {
-    "category": "按内容分类统计，例如：学习、编程、视频、娱乐。",
-    "domain": "按网页域名包含匹配，例如：bilibili.com、github.com。",
-    "app": "按程序名包含匹配，例如：code.exe、chrome.exe。",
-    "learning_topic": "按学习主题统计；匹配模式留空表示全部学习主题。",
-}
-
-
-def target_label(value: str) -> str:
-    return TARGET_LABELS.get(value, value or "全部")
-
-
-def source_label(value: str) -> str:
-    return SOURCE_LABELS.get(value, value or "用户纠正")
-
-
-def short_activity_hint(exe_name: str = "", domain: str = "", title: str = "", category: str = "") -> str:
-    text = " ".join((exe_name, domain, title, category)).casefold()
-    hints = [
-        (("dazidazi.com", "dazidazi", "monkeytype", "10fastfingers", "typing", "type practice", "打字", "键盘练习"), "打字"),
-        (("codex", "chatgpt", "openai", "claude", "deepseek", "kimi", "doubao"), "AI助手"),
-        (("figma", "canva", "photoshop", "illustrator", "sketch"), "设计"),
-        (("excalidraw", "draw.io", "diagram", "流程图"), "绘图"),
-        (("notion", "obsidian", "onenote", "笔记"), "笔记"),
-        (("gmail", "outlook", "mail", "邮箱", "邮件"), "邮件"),
-        (("calendar", "日历", "日程"), "日程"),
-        (("translate", "翻译"), "翻译"),
-        (("github", "vscode", "visual studio", "pycharm", "编程", "代码"), "编程"),
-        (("docs", "word", "文档"), "文档"),
-        (("excel", "sheet", "表格"), "表格"),
-    ]
-    for keys, label in hints:
-        if any(key in text for key in keys):
-            return label
-    if category in {"学习", "编程", "游戏", "音乐", "娱乐", "购物", "新闻", "聊天", "办公"}:
-        return category
-    return ""
-
-
 def build_app_icon() -> QIcon:
+    global _APP_ICON_CACHE
+    if _APP_ICON_CACHE is not None:
+        return _APP_ICON_CACHE
     pix = QPixmap(64, 64)
     pix.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pix)
@@ -198,7 +210,8 @@ def build_app_icon() -> QIcon:
     painter.drawRoundedRect(29, 24, 7, 24, 3, 3)
     painter.drawRoundedRect(40, 14, 7, 34, 3, 3)
     painter.end()
-    return QIcon(pix)
+    _APP_ICON_CACHE = QIcon(pix)
+    return _APP_ICON_CACHE
 
 
 def is_dark_theme(settings: AppSettings) -> bool:
@@ -223,706 +236,6 @@ def apply_windows_backdrop(widget: QWidget, dark: bool) -> None:
         dwm.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(backdrop), ctypes.sizeof(backdrop))
     except Exception:
         pass
-
-
-def data_definition_text() -> str:
-    return (
-        "核心口径\n"
-        "1. 前台注视时长：窗口获得焦点，且未被判定为空闲时累计。它代表你正在操作或关注的主要窗口。\n"
-        "2. 总运行时长：进程存在的时间，后台运行也累计。它用于判断软件开着多久，不等于你看了多久。\n"
-        "3. 后台时长：总运行时长减去前台注视时长，主要用于分析常驻软件、播放器、同步工具等。\n"
-        "4. 网页注视时长：浏览器在前台时，结合浏览器扩展上报的活动标签页、URL、域名和标题累计。\n"
-        "5. 视频播放时长：网页视频、发声视频标签页或浏览器媒体会话播放时累计。它可能和前台注视同时发生。\n"
-        "6. 音乐播放时长：酷狗、网易云、Spotify、网页音乐域名、B 站音乐视频等音乐内容播放时累计。\n"
-        "7. 音乐分析：按“歌曲 + 歌手”尽量去重后统计，适合看重复播放和听歌习惯。\n\n"
-        "容易混淆的地方\n"
-        "- 前台注视、视频播放、音乐播放不是互斥时间。比如你前台写 OneNote，左侧网页视频播放，二者会分别记录。\n"
-        "- B 站音乐视频可以同时属于“视频播放”和“音乐播放/音乐分析”，因为它既有视频画面，也是在播放音乐内容。\n"
-        "- 后台音乐不会并入前台注视，但会进入音乐播放和音乐分析。\n"
-        "- 当前运行列表可以切换排序：当前优先、前台排行、运行排行、按名称；行内标题只是补充说明，不参与排序。\n"
-        "- 空闲时默认不累计前台注视；如果开启媒体/手写豁免，播放视频音乐或 OneNote 手写场景可继续计入。\n"
-        "- 联网分类增强会在本地不确定，或 B 站等泛内容平台只得到宽泛分类时尝试细分；隐私模式下自动关闭，不会覆盖你手动添加的分类规则。"
-    )
-
-
-def online_feature_state(enabled: bool, private_mode: bool) -> str:
-    if private_mode and enabled:
-        return "关闭（隐私模式生效）"
-    if private_mode:
-        return "关闭（隐私模式）"
-    if enabled:
-        return "开启"
-    return "关闭（设置关闭）"
-
-
-class ProgressBarWidget(QWidget):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.value = 0.0
-        self.accent = QColor("#1677d2")
-        self.track = QColor(120, 140, 165, 55)
-        self.setFixedHeight(5)
-
-    def set_value(self, value: float, accent: str) -> None:
-        self.value = max(0.0, min(1.0, value))
-        self.accent = QColor(accent)
-        self.update()
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = QRectF(0, 1, self.width(), 3)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(self.track)
-        painter.drawRoundedRect(rect, 2, 2)
-        if self.value > 0:
-            painter.setBrush(self.accent)
-            painter.drawRoundedRect(QRectF(rect.left(), rect.top(), rect.width() * self.value, rect.height()), 2, 2)
-        painter.end()
-
-
-class SortableTableItem(QTableWidgetItem):
-    def __lt__(self, other: QTableWidgetItem) -> bool:
-        left = self.data(Qt.ItemDataRole.UserRole)
-        right = other.data(Qt.ItemDataRole.UserRole)
-        if left is not None and right is not None:
-            try:
-                return float(left) < float(right)
-            except (TypeError, ValueError):
-                pass
-        left_text = self.text().casefold()
-        right_text = other.text().casefold() if other is not None else ""
-        return left_text < right_text
-
-
-class ProcessRow(QFrame):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setObjectName("processRow")
-        self.setFixedHeight(62)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 6, 10, 6)
-        layout.setSpacing(9)
-
-        self.icon_label = QLabel()
-        self.icon_label.setFixedSize(28, 28)
-        self.icon_label.setScaledContents(True)
-        layout.addWidget(self.icon_label)
-
-        text_box = QVBoxLayout()
-        text_box.setContentsMargins(0, 0, 0, 0)
-        text_box.setSpacing(1)
-        self.name_label = QLabel()
-        self.name_label.setObjectName("processName")
-        self.name_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self.path_label = QLabel()
-        self.path_label.setObjectName("processPath")
-        self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self.progress_bar = ProgressBarWidget()
-        text_box.addWidget(self.name_label)
-        text_box.addWidget(self.path_label)
-        text_box.addWidget(self.progress_bar)
-        layout.addLayout(text_box, 1)
-
-        self.time_label = QLabel()
-        self.time_label.setObjectName("processTime")
-        self.time_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.time_label.setMinimumWidth(66)
-        layout.addWidget(self.time_label)
-
-    def set_data(
-        self,
-        icon: QIcon,
-        proc: RunningProcess,
-        today_foreground: float,
-        today_running: float,
-        cumulative_foreground: float,
-        cumulative_running: float,
-        is_foreground: bool,
-        detail_text: str = "",
-        content_lines: list[str] | None = None,
-        display_metric: str = "foreground",
-    ) -> None:
-        pixmap = icon.pixmap(28, 28)
-        self.icon_label.setPixmap(pixmap)
-        self.name_label.setText(proc.exe_name)
-        if display_metric == "running":
-            primary_label = "运行"
-            primary_seconds = today_running
-            subtitle = f"运行 {format_duration(today_running)} · 前台 {format_duration(today_foreground)}"
-        else:
-            primary_label = "前台"
-            primary_seconds = today_foreground
-            subtitle = f"前台 {format_duration(today_foreground)}"
-        if detail_text:
-            subtitle = f"{subtitle} · {detail_text}"
-        elif proc.instance_count > 1:
-            subtitle = f"{subtitle} · {proc.instance_count} 个实例"
-        self.path_label.setText(subtitle)
-        self.time_label.setText(format_duration(primary_seconds))
-        self.time_label.setToolTip(f"{primary_label}时长：{format_duration_long(primary_seconds)}")
-        self.setProperty("active", "true" if is_foreground else "false")
-        ratio = today_foreground / today_running if today_running > 0 else 0.0
-        self.progress_bar.set_value(ratio, "#55d6be" if is_foreground else "#1677d2")
-        self.style().unpolish(self)
-        self.style().polish(self)
-
-        today_background = max(0.0, today_running - today_foreground)
-        content_html = ""
-        if content_lines:
-            escaped_lines = "<br>".join(html.escape(line) for line in content_lines)
-            content_html = f"<br><br><b>今日内容 Top</b><br>{escaped_lines}"
-        tooltip = (
-            f"<b>{html.escape(proc.exe_name)}</b><br>"
-            f"今日前台：{html.escape(format_duration_long(today_foreground))}<br>"
-            f"今日总运行：{html.escape(format_duration_long(today_running))}<br>"
-            f"今日后台：{html.escape(format_duration_long(today_background))}<br>"
-            f"累计前台：{html.escape(format_duration_long(cumulative_foreground))}<br>"
-            f"累计总运行：{html.escape(format_duration_long(cumulative_running))}<br>"
-            f"路径：{html.escape(proc.exe_path)}"
-            f"{content_html}"
-        )
-        self.setToolTip(tooltip)
-
-
-class StatCard(QFrame):
-    def __init__(self, title: str, accent: str, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setObjectName("statCard")
-        self.accent = accent
-        self.setMinimumHeight(86)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(4)
-
-        self.title_label = QLabel(title)
-        self.title_label.setObjectName("statCardTitle")
-        self.value_label = QLabel("0s")
-        self.value_label.setObjectName("statCardValue")
-        self.subtitle_label = QLabel("")
-        self.subtitle_label.setObjectName("statCardSub")
-        self.subtitle_label.setWordWrap(True)
-        layout.addWidget(self.title_label)
-        layout.addWidget(self.value_label)
-        layout.addWidget(self.subtitle_label)
-
-    def set_data(self, value: float | str, subtitle: str = "") -> None:
-        self.value_label.setText(format_duration(value) if isinstance(value, (int, float)) else value)
-        self.subtitle_label.setText(subtitle)
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(self.accent))
-        painter.drawRoundedRect(QRectF(0, 12, 4, self.height() - 24), 2, 2)
-        painter.end()
-
-
-class BarChartWidget(QWidget):
-    def __init__(self, title: str, accent: str = "#1677d2", parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.title = title
-        self.accent = QColor(accent)
-        self.data: list[tuple[str, float, str]] = []
-        self.setMinimumHeight(230)
-        self.setMouseTracking(True)
-
-    def set_data(self, data: list[tuple[str, float, str]]) -> None:
-        self.data = [(label, max(0.0, float(value)), extra) for label, value, extra in data[:8]]
-        self.update()
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.rect()
-
-        painter.setPen(QColor("#17202a"))
-        font = painter.font()
-        font.setBold(True)
-        font.setPointSize(10)
-        painter.setFont(font)
-        painter.drawText(QRectF(12, 8, rect.width() - 24, 22), Qt.AlignmentFlag.AlignLeft, self.title)
-
-        if not self.data:
-            painter.setPen(QColor("#8a98aa"))
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "暂无数据")
-            painter.end()
-            return
-
-        max_value = max([value for _, value, _ in self.data] or [1.0])
-        chart_top = 40
-        row_gap = 8
-        row_height = max(22, int((rect.height() - chart_top - 12) / max(len(self.data), 1)) - row_gap)
-        label_width = min(150, max(92, int(rect.width() * 0.34)))
-        value_width = 68
-        bar_left = 12 + label_width
-        bar_right = rect.width() - value_width - 12
-        bar_width = max(30, bar_right - bar_left)
-
-        normal_font = painter.font()
-        normal_font.setBold(False)
-        normal_font.setPointSize(9)
-        painter.setFont(normal_font)
-        metrics = painter.fontMetrics()
-        track_color = QColor("#e8eef5")
-        text_color = QColor("#273449")
-        muted_color = QColor("#738196")
-
-        for index, (label, value, extra) in enumerate(self.data):
-            y = chart_top + index * (row_height + row_gap)
-            label_text = metrics.elidedText(label, Qt.TextElideMode.ElideRight, label_width - 10)
-            painter.setPen(text_color)
-            painter.drawText(QRectF(12, y, label_width - 8, row_height), Qt.AlignmentFlag.AlignVCenter, label_text)
-
-            track_rect = QRectF(bar_left, y + 5, bar_width, max(8, row_height - 10))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(track_color)
-            painter.drawRoundedRect(track_rect, 5, 5)
-
-            ratio = value / max_value if max_value else 0
-            fill_width = max(3.0 if value > 0 else 0.0, track_rect.width() * ratio)
-            fill_rect = QRectF(track_rect.left(), track_rect.top(), fill_width, track_rect.height())
-            color = QColor(self.accent)
-            color = color.lighter(100 + min(index * 8, 45))
-            painter.setBrush(color)
-            painter.drawRoundedRect(fill_rect, 5, 5)
-
-            painter.setPen(muted_color)
-            painter.drawText(
-                QRectF(bar_right + 8, y, value_width - 8, row_height),
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                format_duration(value),
-            )
-            if extra:
-                self.setToolTip(extra)
-        painter.end()
-
-
-class HourlyActivityChart(QWidget):
-    COLORS = {
-        "focus": QColor("#1677d2"),
-        "video": QColor("#f0a33a"),
-        "music": QColor("#d95f76"),
-        "learn": QColor("#55b88d"),
-    }
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.title = "24 小时时间分布"
-        self.data: list[tuple[int, float, float, float, float]] = []
-        self.setMinimumHeight(220)
-
-    def set_data(self, rows: list[tuple[int, float, float, float, float]]) -> None:
-        self.data = rows
-        self._update_tooltip()
-        self.update()
-
-    def _update_tooltip(self) -> None:
-        if not self.data:
-            self.setToolTip("暂无时间线数据")
-            return
-        peak = max(self.data, key=lambda row: row[1] + row[2] + row[3])
-        learn_peak = max(self.data, key=lambda row: row[4])
-        self.setToolTip(
-            "24 小时时间分布\n"
-            f"活动高峰：{peak[0]:02d}:00，{format_duration(peak[1] + peak[2] + peak[3])}\n"
-            f"学习高峰：{learn_peak[0]:02d}:00，{format_duration(learn_peak[4])}"
-        )
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.rect()
-
-        painter.setPen(QColor("#17202a"))
-        font = painter.font()
-        font.setBold(True)
-        font.setPointSize(10)
-        painter.setFont(font)
-        painter.drawText(QRectF(12, 8, rect.width() - 24, 22), Qt.AlignmentFlag.AlignLeft, self.title)
-
-        if not self.data:
-            painter.setPen(QColor("#8a98aa"))
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "暂无时间线数据")
-            painter.end()
-            return
-
-        activity_totals = [focus + video + music for _, focus, video, music, _learn in self.data]
-        learning_totals = [learn for *_rest, learn in self.data]
-        totals = activity_totals + learning_totals
-        max_value = max(totals or [1.0])
-        chart = QRectF(18, 46, rect.width() - 36, rect.height() - 94)
-        bar_gap = 3
-        bar_width = max(4.0, (chart.width() - bar_gap * 23) / 24)
-
-        painter.setPen(QColor("#e5ebf2"))
-        grid_font = painter.font()
-        grid_font.setBold(False)
-        grid_font.setPointSize(7)
-        painter.setFont(grid_font)
-        for ratio, label in ((0.5, "50%"), (1.0, "max")):
-            y = chart.bottom() - chart.height() * ratio
-            painter.drawLine(int(chart.left()), int(y), int(chart.right()), int(y))
-            painter.drawText(QRectF(chart.right() - 34, y - 14, 32, 14), Qt.AlignmentFlag.AlignRight, label)
-        painter.setPen(QColor("#d9e1ea"))
-        painter.drawLine(int(chart.left()), int(chart.bottom()), int(chart.right()), int(chart.bottom()))
-        painter.setPen(Qt.PenStyle.NoPen)
-
-        peak_hour = -1
-        if self.data:
-            peak_hour = max(self.data, key=lambda row: row[1] + row[2] + row[3])[0]
-        for hour, focus, video, music, learn in self.data:
-            x = chart.left() + hour * (bar_width + bar_gap)
-            total = focus + video + music
-            if total <= 0 or max_value <= 0:
-                painter.setBrush(QColor("#e8eef5"))
-                painter.drawRoundedRect(QRectF(x, chart.bottom() - 3, bar_width, 3), 2, 2)
-            else:
-                current_bottom = chart.bottom()
-                for value, key in ((music, "music"), (video, "video"), (focus, "focus")):
-                    if value <= 0:
-                        continue
-                    height = max(2.0, chart.height() * (value / max_value))
-                    painter.setBrush(self.COLORS[key])
-                    painter.drawRoundedRect(QRectF(x, current_bottom - height, bar_width, height), 2, 2)
-                    current_bottom -= height
-            if learn > 0 and max_value > 0:
-                learn_height = max(2.0, chart.height() * (learn / max_value))
-                marker_width = max(2.0, min(5.0, bar_width * 0.28))
-                painter.setBrush(self.COLORS["learn"])
-                painter.drawRoundedRect(
-                    QRectF(x + bar_width - marker_width, chart.bottom() - learn_height, marker_width, learn_height),
-                    2,
-                    2,
-                )
-            if hour == peak_hour and max_value > 0:
-                peak_height = max(4.0, chart.height() * (max(total, learn) / max_value))
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QColor("#17202a"))
-                painter.drawRoundedRect(QRectF(x - 1, chart.bottom() - peak_height - 1, bar_width + 2, peak_height + 2), 3, 3)
-                painter.setPen(Qt.PenStyle.NoPen)
-
-        painter.setPen(QColor("#738196"))
-        small = painter.font()
-        small.setBold(False)
-        small.setPointSize(8)
-        painter.setFont(small)
-        for hour in (0, 6, 12, 18, 23):
-            x = chart.left() + hour * (bar_width + bar_gap)
-            painter.drawText(QRectF(x - 8, chart.bottom() + 8, 34, 18), Qt.AlignmentFlag.AlignCenter, f"{hour:02d}")
-
-        legend_y = rect.height() - 24
-        x = 16
-        for label, key in (("前台", "focus"), ("视频", "video"), ("音乐", "music"), ("学习标记", "learn")):
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(self.COLORS[key])
-            painter.drawRoundedRect(QRectF(x, legend_y + 5, 10, 10), 3, 3)
-            painter.setPen(QColor("#273449"))
-            painter.drawText(QRectF(x + 16, legend_y, 70, 20), Qt.AlignmentFlag.AlignVCenter, label)
-            x += 86 if key == "learn" else 60
-        painter.end()
-
-
-class HeatmapWidget(QWidget):
-    COLORS = [
-        QColor("#ebedf0"), QColor("#c6e48b"), QColor("#7bc96f"),
-        QColor("#239a3b"), QColor("#196127"),
-    ]
-
-    def __init__(self, title: str = "学习热力图", parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.title = title
-        self.data: list[tuple[str, float]] = []
-        self.metric_label = "学习"
-        self._cell_rects: list[tuple[QRectF, str, float]] = []
-        self.setMinimumHeight(155)
-        self.setMouseTracking(True)
-
-    def set_data(self, rows: list[tuple[str, float]], metric_label: str = "学习") -> None:
-        if rows:
-            self.data = rows
-        else:
-            self.data = []
-        self.metric_label = metric_label
-        self.update()
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.rect()
-        painter.setPen(QColor("#17202a"))
-        font = painter.font()
-        font.setBold(True)
-        font.setPointSize(10)
-        painter.setFont(font)
-        title_text = f"{self.title}（{self.metric_label}）"
-        painter.drawText(QRectF(12, 6, rect.width() - 24, 22), Qt.AlignmentFlag.AlignLeft, title_text)
-        self._cell_rects = []
-        if not self.data:
-            painter.setPen(QColor("#8a98aa"))
-            painter.drawText(QRectF(16, 30, rect.width() - 32, rect.height() - 30),
-                             Qt.AlignmentFlag.AlignCenter, "暂无足够数据（需使用 1 天以上）")
-            painter.end()
-            return
-        max_val = max(v for _, v in self.data) or 1.0
-        total_cols = (len(self.data) + 6) // 7
-        cell = min(15.0, max(8.0, (rect.width() - 50) / max(total_cols, 1)))
-        cell_gap = 2
-        chart_left = 32
-        chart_top = 36
-        for idx, (date_str, value) in enumerate(self.data):
-            col = idx // 7
-            row = idx % 7
-            ratio = value / max_val if max_val > 0 else 0
-            ci = min(len(self.COLORS) - 1, int(ratio * (len(self.COLORS) - 1) + 0.5)) if value > 0 else 0
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(self.COLORS[ci])
-            x = chart_left + col * (cell + cell_gap)
-            y = chart_top + row * (cell + cell_gap)
-            r = QRectF(x, y, cell, cell)
-            self._cell_rects.append((r, date_str, value))
-            painter.drawRoundedRect(r, 2, 2)
-        painter.setPen(QColor("#738196"))
-        small = painter.font()
-        small.setPointSize(6)
-        painter.setFont(small)
-        days = ("一", "", "三", "", "五", "", "日")
-        for i, label in enumerate(days):
-            y = chart_top + i * (cell + cell_gap) + cell / 2 - 4
-            painter.drawText(QRectF(4, int(y), 24, 12),
-                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, label)
-        painter.end()
-
-    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        from .timefmt import format_duration
-        for r, date_str, value in self._cell_rects:
-            if r.contains(event.position()):
-                tip = f"{date_str} · {self.metric_label} {format_duration(value)}"
-                self.setToolTip(tip)
-                return
-        self.setToolTip("")
-
-
-class LineChartWidget(QWidget):
-    COLORS = {"this": QColor("#1677d2"), "last": QColor("#c4cdd6")}
-
-    def __init__(self, title: str = "本周 vs 上周", parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.title = title
-        self.this_week: list[tuple[str, float]] = []
-        self.last_week: list[tuple[str, float]] = []
-        self.metric_label = "前台"
-        self._bar_rects: list[tuple[QRectF, QRectF, str, float, float]] = []
-        self.setMinimumHeight(180)
-        self.setMouseTracking(True)
-
-    def set_data(self, this: list[tuple[str, float]], last: list[tuple[str, float]],
-                 metric_label: str = "前台") -> None:
-        self.this_week = this or []
-        self.last_week = last or []
-        self.metric_label = metric_label
-        self.update()
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.rect()
-        painter.setPen(QColor("#17202a"))
-        font = painter.font()
-        font.setBold(True)
-        font.setPointSize(10)
-        painter.setFont(font)
-        title_text = f"{self.title}（{self.metric_label}）"
-        painter.drawText(QRectF(12, 6, rect.width() - 24, 22),
-                         Qt.AlignmentFlag.AlignLeft, title_text)
-        self._bar_rects = []
-        if not self.this_week:
-            painter.setPen(QColor("#8a98aa"))
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "暂无数据")
-            painter.end()
-            return
-        has_any = any(v > 0 for _, v in self.this_week) or any(v > 0 for _, v in self.last_week)
-        if not has_any:
-            painter.setPen(QColor("#8a98aa"))
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "暂无数据（本周尚未产生记录）")
-            painter.end()
-            return
-        all_vals = [v for _, v in self.this_week] + [v for _, v in self.last_week]
-        max_val = max(all_vals or [1.0])
-        chart = QRectF(52, 40, rect.width() - 68, rect.height() - 74)
-        bar_w = max(6.0, (chart.width() - 100) / 14)
-        gap = 3
-        group_w = bar_w * 2 + gap
-        painter.setPen(QColor("#d9e1ea"))
-        painter.drawLine(int(chart.left()), int(chart.bottom()), int(chart.right()), int(chart.bottom()))
-        painter.setPen(Qt.PenStyle.NoPen)
-        for i in range(7):
-            if i >= len(self.this_week):
-                break
-            day_label = self.this_week[i][0] if i < len(self.this_week) else ""
-            tv = self.this_week[i][1] if i < len(self.this_week) else 0
-            lv = self.last_week[i][1] if i < len(self.last_week) else 0
-            gx = chart.left() + i * (group_w + 8)
-            r1 = QRectF(0, 0, 0, 0)
-            r2 = QRectF(0, 0, 0, 0)
-            for val, key in ((lv, "last"), (tv, "this")):
-                h = max(2.0, chart.height() * (val / max_val)) if max_val > 0 else 2
-                offset = 0 if key == "last" else bar_w + gap
-                r = QRectF(gx + offset, chart.bottom() - h, bar_w, h)
-                if key == "last":
-                    r1 = r
-                else:
-                    r2 = r
-                painter.setBrush(self.COLORS[key])
-                painter.drawRoundedRect(r, 2, 2)
-            self._bar_rects.append((r1, r2, day_label, lv, tv))
-            painter.setPen(QColor("#738196"))
-            ff = painter.font()
-            ff.setPointSize(7)
-            painter.setFont(ff)
-            painter.drawText(QRectF(gx - 2, chart.bottom() + 6, group_w + 8, 14),
-                             Qt.AlignmentFlag.AlignCenter, day_label[:2])
-        legend_y = rect.height() - 22
-        painter.setPen(Qt.PenStyle.NoPen)
-        for label, key, lx in (("本周", "this", chart.left()), ("上周", "last", chart.left() + 56)):
-            painter.setBrush(self.COLORS[key])
-            painter.drawRoundedRect(QRectF(lx, legend_y + 4, 10, 10), 3, 3)
-            painter.setPen(QColor("#273449"))
-            painter.drawText(QRectF(lx + 16, legend_y, 40, 18), Qt.AlignmentFlag.AlignVCenter, label)
-        painter.end()
-
-    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        from .timefmt import format_duration
-        for r1, r2, day, lv, tv in self._bar_rects:
-            if r1.contains(event.position()) or r2.contains(event.position()):
-                tip = f"{day} · 本周 {format_duration(tv)} · 上周 {format_duration(lv)}"
-                self.setToolTip(tip)
-                return
-        self.setToolTip("")
-
-
-class DonutChartWidget(QWidget):
-    COLORS = ["#1677d2", "#55b88d", "#f0a33a", "#d95f76", "#8b72d9", "#2f9aa0", "#6b7c93"]
-
-    def __init__(self, title: str, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.title = title
-        self.data: list[tuple[str, float, float]] = []
-        self._legend_rects: list[tuple[QRectF, str, float, float, float]] = []
-        self.setMinimumHeight(230)
-        self.setMouseTracking(True)
-
-    def set_data(self, data: list[tuple[str, float, float]]) -> None:
-        self.data = [(name, max(0.0, attention), max(0.0, background)) for name, attention, background in data[:7]]
-        self._update_tooltip()
-        self.update()
-
-    def _update_tooltip(self) -> None:
-        totals = [(name, attention, background, attention + background) for name, attention, background in self.data if attention + background > 0]
-        if not totals:
-            self.setToolTip("暂无分类数据")
-            return
-        name, attention, background, total = max(totals, key=lambda item: item[3])
-        all_total = sum(item[3] for item in totals)
-        percent = total / all_total * 100.0 if all_total > 0 else 0.0
-        self.setToolTip(
-            f"最大分类：{name} · {format_duration(total)} · {percent:.1f}%\n"
-            f"注视 {format_duration(attention)} · 播放/后台 {format_duration(background)}"
-        )
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.rect()
-        self._legend_rects = []
-
-        painter.setPen(QColor("#17202a"))
-        font = painter.font()
-        font.setBold(True)
-        font.setPointSize(10)
-        painter.setFont(font)
-        painter.drawText(QRectF(12, 8, rect.width() - 24, 22), Qt.AlignmentFlag.AlignLeft, self.title)
-
-        totals = [(name, attention + background) for name, attention, background in self.data if attention + background > 0]
-        total = sum(value for _, value in totals)
-        if total <= 0:
-            painter.setPen(QColor("#8a98aa"))
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "暂无分类数据")
-            painter.end()
-            return
-
-        side = min(150, rect.height() - 64, max(92, int(rect.width() * 0.38)))
-        pie_rect = QRectF(16, 52, side, side)
-        start_angle = 90 * 16
-        painter.setPen(Qt.PenStyle.NoPen)
-        for index, (_, value) in enumerate(totals):
-            span = int(-(value / total) * 360 * 16)
-            painter.setBrush(QColor(self.COLORS[index % len(self.COLORS)]))
-            painter.drawPie(pie_rect, start_angle, span)
-            start_angle += span
-
-        painter.setBrush(QColor("#f6f8fb"))
-        inner = pie_rect.adjusted(side * 0.24, side * 0.24, -side * 0.24, -side * 0.24)
-        painter.drawEllipse(inner)
-        painter.setPen(QColor("#17202a"))
-        center_font = painter.font()
-        center_font.setBold(True)
-        center_font.setPointSize(12)
-        painter.setFont(center_font)
-        painter.drawText(inner.adjusted(0, -8, 0, -2), Qt.AlignmentFlag.AlignCenter, format_duration(total))
-        sub_font = painter.font()
-        sub_font.setBold(False)
-        sub_font.setPointSize(8)
-        painter.setFont(sub_font)
-        painter.setPen(QColor("#738196"))
-        painter.drawText(inner.adjusted(0, 18, 0, 0), Qt.AlignmentFlag.AlignCenter, "总时长")
-
-        legend_left = int(pie_rect.right() + 18)
-        legend_width = rect.width() - legend_left - 12
-        legend_font = painter.font()
-        legend_font.setBold(False)
-        legend_font.setPointSize(9)
-        painter.setFont(legend_font)
-        metrics = painter.fontMetrics()
-        y = 50
-        for index, (name, value) in enumerate(totals[:7]):
-            color = QColor(self.COLORS[index % len(self.COLORS)])
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(color)
-            painter.drawRoundedRect(QRectF(legend_left, y + 5, 10, 10), 3, 3)
-            percent = f"{value / total * 100:.0f}%"
-            text = metrics.elidedText(f"{name} · {format_duration(value)} · {percent}", Qt.TextElideMode.ElideRight, legend_width - 18)
-            painter.setPen(QColor("#273449"))
-            row_rect = QRectF(legend_left + 18, y, legend_width - 18, 20)
-            painter.drawText(row_rect, Qt.AlignmentFlag.AlignVCenter, text)
-            attention = next((a for n, a, _b in self.data if n == name), 0.0)
-            background = next((b for n, _a, b in self.data if n == name), 0.0)
-            self._legend_rects.append((QRectF(legend_left, y, legend_width, 20), name, value, attention, background))
-            y += 24
-        painter.end()
-
-    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        totals = [(name, attention + background) for name, attention, background in self.data if attention + background > 0]
-        total = sum(value for _, value in totals)
-        for rect, name, value, attention, background in self._legend_rects:
-            if rect.contains(event.position()):
-                pct = value / total * 100.0 if total > 0 else 0.0
-                self.setToolTip(
-                    f"{name} · {format_duration(value)} · {pct:.1f}%\n"
-                    f"注视 {format_duration(attention)} · 播放/后台 {format_duration(background)}"
-                )
-                return
-        self._update_tooltip()
 
 
 class SettingsDialog(QDialog):
@@ -980,7 +293,7 @@ class SettingsDialog(QDialog):
         self.online_music_lookup_box.setChecked(settings.online_music_lookup)
         general_layout.addWidget(self.online_music_lookup_box)
 
-        self.online_category_lookup_box = QCheckBox("联网增强程序/网页分类（本地不确定或泛内容平台粗分类时使用）")
+        self.online_category_lookup_box = QCheckBox("联网增强分类：本地规则不确定，或 B 站等泛内容平台只得到宽泛分类时尝试细分")
         self.online_category_lookup_box.setChecked(settings.online_category_lookup)
         general_layout.addWidget(self.online_category_lookup_box)
         self.private_title_box.toggled.connect(self._sync_privacy_dependent_controls)
@@ -1133,7 +446,10 @@ class SettingsDialog(QDialog):
         category_layout = QVBoxLayout(category_panel)
         category_layout.setContentsMargins(12, 12, 12, 12)
         category_layout.setSpacing(8)
-        category_layout.addWidget(QLabel("网页/内容分类规则（匹配位置：程序/域名/标题/全部；来源区分本地、联网和用户纠正）"))
+        category_intro = QLabel("网页/内容分类规则：优先用域名规则识别网站，用标题规则细分 B 站/YouTube 等内容，用程序规则识别本地应用。来源会区分本地、联网和用户纠正。")
+        category_intro.setObjectName("settingsHint")
+        category_intro.setWordWrap(True)
+        category_layout.addWidget(category_intro)
         self.category_table = QTableWidget(0, 4)
         self.category_table.setHorizontalHeaderLabels(["关键词", "分类", "匹配位置", "来源"])
         self.category_table.verticalHeader().setVisible(False)
@@ -1145,7 +461,7 @@ class SettingsDialog(QDialog):
 
         category_row = QHBoxLayout()
         self.category_pattern_input = QLineEdit()
-        self.category_pattern_input.setPlaceholderText("例如: 原神 / coursera.org / steam.exe")
+        self.category_pattern_input.setPlaceholderText("关键词，例如: 原神 / coursera.org / steam.exe")
         self.category_name_input = QLineEdit()
         self.category_name_input.setPlaceholderText("例如: 游戏 / 学习")
         self.category_target_combo = QComboBox()
@@ -1164,6 +480,18 @@ class SettingsDialog(QDialog):
         category_row.addWidget(remove_category_button)
         category_row.addWidget(restore_category_button)
         category_layout.addLayout(category_row)
+        self.category_rule_preview = QLabel("")
+        self.category_rule_preview.setObjectName("settingsHint")
+        self.category_rule_preview.setWordWrap(True)
+        category_layout.addWidget(self.category_rule_preview)
+        self.category_pattern_input.textChanged.connect(self._update_category_rule_preview)
+        self.category_name_input.textChanged.connect(self._update_category_rule_preview)
+        self.category_target_combo.currentIndexChanged.connect(self._update_category_rule_preview)
+        category_help = QLabel("选择建议：网页域名固定时选“域名”；同一平台下按内容细分时选“标题”；本地软件选“程序”；不确定时选“全部”。")
+        category_help.setObjectName("settingsHint")
+        category_help.setWordWrap(True)
+        category_layout.addWidget(category_help)
+        self._update_category_rule_preview()
         self.settings_tabs.addTab(category_panel, "分类规则")
 
         goal_panel = QFrame()
@@ -1186,11 +514,33 @@ class SettingsDialog(QDialog):
         goal_header.addLayout(goal_title_box, 1)
         self.goal_total_card = self._make_goal_summary_card("目标数", "0", "全部")
         self.goal_enabled_card = self._make_goal_summary_card("启用", "0", "正在跟踪")
+        self.goal_progress_card = self._make_goal_summary_card("今日达成", "0/0", "目标进度")
         self.goal_limit_card = self._make_goal_summary_card("限制", "0", "不超过")
         goal_header.addWidget(self.goal_total_card)
         goal_header.addWidget(self.goal_enabled_card)
+        goal_header.addWidget(self.goal_progress_card)
         goal_header.addWidget(self.goal_limit_card)
         goal_layout.addLayout(goal_header)
+
+        template_row = QHBoxLayout()
+        template_row.setSpacing(8)
+        template_label = QLabel("常用模板")
+        template_label.setObjectName("settingsHint")
+        template_row.addWidget(template_label)
+        for label, name, metric, pattern, hours, direction in (
+            ("学习至少 1 小时", "学习至少 1 小时", "learning_topic", "", 1.0, "min"),
+            ("编程至少 2 小时", "编程至少 2 小时", "category", "编程", 2.0, "min"),
+            ("娱乐不超过 1 小时", "娱乐不超过 1 小时", "category", "娱乐", 1.0, "max"),
+            ("视频不超过 1 小时", "视频不超过 1 小时", "category", "视频", 1.0, "max"),
+        ):
+            template_btn = QPushButton(label)
+            template_btn.setObjectName("subtleButton")
+            template_btn.clicked.connect(
+                lambda _checked=False, n=name, m=metric, p=pattern, h=hours, d=direction: self._apply_goal_template(n, m, p, h, d)
+            )
+            template_row.addWidget(template_btn)
+        template_row.addStretch(1)
+        goal_layout.addLayout(template_row)
 
         goal_tip_grid = QGridLayout()
         goal_tip_grid.setHorizontalSpacing(8)
@@ -1219,9 +569,16 @@ class SettingsDialog(QDialog):
         self.goal_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.goal_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.goal_table.setAlternatingRowColors(True)
-        self.goal_table.setMinimumHeight(240)
+        self.goal_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.goal_table.verticalHeader().setDefaultSectionSize(32)
+        self.goal_table.setShowGrid(False)
+        self.goal_table.setMinimumHeight(210)
         self.goal_table.itemSelectionChanged.connect(self._load_selected_goal)
         goal_layout.addWidget(self.goal_table, 1)
+        self.goal_empty_label = QLabel("暂无目标。可以先点上方模板，或在下方手动创建一个目标。")
+        self.goal_empty_label.setObjectName("goalEmptyHint")
+        self.goal_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        goal_layout.addWidget(self.goal_empty_label)
 
         goal_editor = QFrame()
         goal_editor.setObjectName("goalEditor")
@@ -1303,6 +660,33 @@ class SettingsDialog(QDialog):
         backup_button = QPushButton("备份数据库")
         optimize_button = QPushButton("优化数据库")
         cleanup_timeline_button = QPushButton("清理旧时间线")
+        self.repair_unknown_button = QPushButton("修复未识别内容")
+        self.repair_unknown_button.setObjectName("primaryButton")
+        self.repair_unknown_button.setToolTip("后台修复低置信内容：先用本地分类规则回填；若允许联网分类，会在时间预算内继续查询网页信息。")
+        health = self.storage.recognition_health_range(date.today() - timedelta(days=6), date.today())
+        repair_card = QFrame()
+        repair_card.setObjectName("repairCard")
+        repair_layout = QHBoxLayout(repair_card)
+        repair_layout.setContentsMargins(12, 10, 12, 10)
+        repair_layout.setSpacing(10)
+        repair_text_box = QVBoxLayout()
+        repair_text_box.setSpacing(3)
+        repair_title = QLabel("识别数据修复")
+        repair_title.setObjectName("repairTitle")
+        repair_desc = QLabel(
+            "低置信内容、仍归为“视频/其他”的网页会优先用本地规则重算；允许联网分类时会限量查询网页信息再回填。"
+        )
+        repair_desc.setObjectName("settingsHint")
+        repair_desc.setWordWrap(True)
+        self.repair_status_label = QLabel(
+            f"近 7 天低置信 {health.get('low_confidence_rows', 0)} 条 · 泛视频 {health.get('broad_video_rows', 0)} 条 · 仅域名 {health.get('web_domain_only_rows', 0)} 条"
+        )
+        self.repair_status_label.setObjectName("repairStatus")
+        repair_text_box.addWidget(repair_title)
+        repair_text_box.addWidget(repair_desc)
+        repair_text_box.addWidget(self.repair_status_label)
+        repair_layout.addLayout(repair_text_box, 1)
+        repair_layout.addWidget(self.repair_unknown_button, 0, Qt.AlignmentFlag.AlignVCenter)
         danger_label = QLabel("危险操作")
         danger_label.setObjectName("sectionLabel")
         clear_button = QPushButton("清除数据")
@@ -1313,6 +697,7 @@ class SettingsDialog(QDialog):
         backup_button.clicked.connect(self.backup_database)
         optimize_button.clicked.connect(self.optimize_database)
         cleanup_timeline_button.clicked.connect(self.cleanup_timeline)
+        self.repair_unknown_button.clicked.connect(self.repair_unidentified_content)
         clear_button.clicked.connect(self.clear_usage_data)
         export_grid.addWidget(export_button, 0, 0)
         export_grid.addWidget(export_content_button, 0, 1)
@@ -1325,19 +710,24 @@ class SettingsDialog(QDialog):
         data_layout.addLayout(export_grid)
         data_layout.addWidget(maintenance_label)
         data_layout.addLayout(maintenance_grid)
+        data_layout.addWidget(repair_card)
         data_layout.addWidget(danger_label)
         data_layout.addWidget(clear_button, 0, Qt.AlignmentFlag.AlignLeft)
         data_layout.addStretch(1)
         self.settings_tabs.addTab(data_panel, "数据")
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        if buttons.button(QDialogButtonBox.StandardButton.Save):
+            buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
+        if buttons.button(QDialogButtonBox.StandardButton.Cancel):
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self.save)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
         self.setStyleSheet(
             """
-            QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "Noto Sans CJK SC", "Segoe UI", "Arial"; }
+            QDialog { background: #f6f8fb; color: #17202a; font-family: {ui_font_stack()}; }
             QFrame#settingsPanel { background: white; border: 1px solid #d9e1ea; border-radius: 8px; }
             QLabel#sectionLabel { color: #607089; font-weight: 700; }
             QLabel#settingsHint { color: #64748b; font-size: 12px; }
@@ -1374,6 +764,13 @@ class SettingsDialog(QDialog):
                 border: 1px solid #d9e1ea;
                 border-radius: 8px;
             }
+            QLabel#goalEmptyHint {
+                color: #64748b;
+                background: #f8fafc;
+                border: 1px dashed #cbd5e1;
+                border-radius: 8px;
+                padding: 8px 10px;
+            }
             QLabel#goalFormHint {
                 color: #475569;
                 background: #ffffff;
@@ -1381,15 +778,30 @@ class SettingsDialog(QDialog):
                 border-radius: 6px;
                 padding: 6px 8px;
             }
+            QFrame#repairCard {
+                background: #f8fbff;
+                border: 1px solid #bfdbfe;
+                border-radius: 8px;
+            }
+            QLabel#repairTitle {
+                color: #0f172a;
+                font-weight: 800;
+            }
+            QLabel#repairStatus {
+                color: #1d4ed8;
+                font-weight: 650;
+            }
             QLineEdit, QListWidget, QComboBox, QTableWidget {
                 border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px; background: white;
             }
             QPushButton { padding: 6px 10px; border: 1px solid #b9c6d4; border-radius: 6px; background: #ffffff; }
             QPushButton#primaryButton { background: #1677d2; color: white; border-color: #1677d2; font-weight: 700; }
+            QPushButton#subtleButton { background: #f8fafc; color: #334155; border-color: #d9e1ea; }
             QPushButton:disabled, QCheckBox:disabled { color: #94a3b8; }
             QPushButton:hover { background: #eef6ff; }
             QPushButton#primaryButton:hover { background: #1268bb; }
-            """
+            QPushButton#subtleButton:hover { background: #eef6ff; color: #0f172a; }
+            """.replace("{ui_font_stack()}", ui_font_stack())
         )
         self._sync_privacy_dependent_controls()
 
@@ -1403,7 +815,7 @@ class SettingsDialog(QDialog):
         privacy_enabled = self.private_title_box.isChecked()
         privacy_tip = "隐私模式下不会进行联网音乐校验或联网分类。关闭隐私模式后会恢复这里保存的开关状态。"
         music_tip = "联网校验网页标题是否为音乐；仅在关闭隐私模式时生效。"
-        category_tip = "联网增强程序/网页分类；关闭隐私模式时，在本地不确定或泛内容平台粗分类时尝试细分。"
+        category_tip = "本地规则不确定，或 B 站等泛内容平台只得到宽泛分类时，联网尝试细分；隐私模式下自动禁用。"
         for widget, normal_tip in (
             (self.online_music_lookup_box, music_tip),
             (self.online_category_lookup_box, category_tip),
@@ -1502,9 +914,52 @@ class SettingsDialog(QDialog):
         target = str(self.category_target_combo.currentData() or "any")
         if not pattern:
             return
-        self._append_category_rule(pattern, category, target, "user")
+        existing_row = self._find_category_rule_row(pattern, target)
+        if existing_row >= 0:
+            answer = QMessageBox.question(
+                self,
+                "更新已有规则",
+                f"已存在关键词“{pattern}”的规则。是否更新为：{target_label(target)} → {category}？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.category_table.item(existing_row, 1).setText(category)
+            self.category_table.item(existing_row, 2).setText(target_label(target))
+            self.category_table.item(existing_row, 2).setData(Qt.ItemDataRole.UserRole, target)
+            self.category_table.item(existing_row, 3).setText(source_label("user"))
+            self.category_table.item(existing_row, 3).setData(Qt.ItemDataRole.UserRole, "user")
+            self.category_table.selectRow(existing_row)
+        else:
+            self._append_category_rule(pattern, category, target, "user")
         self.category_pattern_input.clear()
         self.category_name_input.clear()
+        self._update_category_rule_preview()
+
+    def _find_category_rule_row(self, pattern: str, target: str = "") -> int:
+        pattern_l = pattern.strip().lower()
+        target_l = target.strip().lower()
+        for row in range(self.category_table.rowCount()):
+            item = self.category_table.item(row, 0)
+            target_item = self.category_table.item(row, 2)
+            row_target = str(target_item.data(Qt.ItemDataRole.UserRole) or target_item.text()).strip().lower() if target_item else ""
+            if item and item.text().strip().lower() == pattern_l and (not target_l or row_target == target_l):
+                return row
+        return -1
+
+    def _update_category_rule_preview(self) -> None:
+        pattern = self.category_pattern_input.text().strip().lower()
+        category = self.category_name_input.text().strip() or "其他"
+        target = str(self.category_target_combo.currentData() or "any")
+        if not pattern:
+            self.category_rule_preview.setText("先输入关键词。标题适合细分 B 站/YouTube 内容，域名适合普通网站，程序适合本地应用。")
+            return
+        duplicate = self._find_category_rule_row(pattern, target) >= 0
+        prefix = "将更新已有规则：" if duplicate else "将添加规则："
+        self.category_rule_preview.setText(
+            f"{prefix}{target_label(target)}包含“{pattern}”时归为“{category}”。保存后会用于后续识别，也会回填可匹配的历史汇总。"
+        )
 
     def remove_selected_category_rules(self) -> None:
         rows = sorted({index.row() for index in self.category_table.selectedIndexes()}, reverse=True)
@@ -1614,6 +1069,100 @@ class SettingsDialog(QDialog):
         self.data_changed.emit()
         QMessageBox.information(self, "清理完成", f"已清理 {removed} 条旧时间线事件，保留最近 {retention_days} 天。")
 
+    def repair_unidentified_content(self) -> None:
+        running_thread = getattr(self, "_repair_thread", None)
+        if running_thread is not None and running_thread.is_alive():
+            QMessageBox.information(self, "正在修复", "未识别内容修复正在后台运行，请稍后查看结果。")
+            return
+        use_online = self.online_category_lookup_box.isChecked() and not self.private_title_box.isChecked()
+        self._repair_result = None
+        self._repair_error = None
+        self.repair_unknown_button.setEnabled(False)
+        self.repair_unknown_button.setText("修复中...")
+        if hasattr(self, "repair_status_label"):
+            mode_text = "本地规则 + 联网增强" if use_online else "本地规则"
+            self.repair_status_label.setText(f"正在后台修复：{mode_text}。窗口可继续使用，不会阻塞。")
+
+        db_path = self.storage.db_path
+
+        def worker() -> None:
+            worker_storage: Storage | None = None
+            try:
+                worker_storage = Storage(db_path)
+                self._repair_result = worker_storage.repair_unidentified_content(
+                    online=use_online,
+                    limit=5000,
+                    online_limit=420 if use_online else 0,
+                    online_time_budget_seconds=110.0,
+                )
+            except Exception as exc:
+                self._repair_error = exc
+            finally:
+                if worker_storage is not None:
+                    worker_storage.close()
+
+        self._repair_thread = threading.Thread(target=worker, name="UsageWidgetRepairUnknown", daemon=True)
+        self._repair_thread.start()
+        if not hasattr(self, "_repair_poll_timer"):
+            self._repair_poll_timer = QTimer(self)
+            self._repair_poll_timer.setInterval(350)
+            self._repair_poll_timer.timeout.connect(self._poll_repair_unidentified_content)
+        self._repair_poll_timer.start()
+
+    def _poll_repair_unidentified_content(self) -> None:
+        running_thread = getattr(self, "_repair_thread", None)
+        if running_thread is not None and running_thread.is_alive():
+            return
+        if hasattr(self, "_repair_poll_timer"):
+            self._repair_poll_timer.stop()
+        self.repair_unknown_button.setEnabled(True)
+        self.repair_unknown_button.setText("修复未识别内容")
+        error = getattr(self, "_repair_error", None)
+        if error is not None:
+            if hasattr(self, "repair_status_label"):
+                self.repair_status_label.setText("修复失败，可在运行诊断中查看最近日志。")
+            show_operation_error(self, "修复失败", error)
+            return
+        stats = getattr(self, "_repair_result", None) or {}
+        self.data_changed.emit()
+        online_enabled = bool(int(stats.get("online_enabled", 0) or 0))
+        if hasattr(self, "repair_status_label"):
+            skip_hint = (
+                f" · 候选 {stats.get('online_candidates', 0)} 条"
+                f" · 跳过 {int(stats.get('online_skipped', 0) or 0) + int(stats.get('online_limit_skipped', 0) or 0)} 条"
+            ) if online_enabled else " · 联网未启用"
+            self.repair_status_label.setText(
+                f"最近修复：检查 {stats.get('checked', 0)} 条 · 本地 {stats.get('local_updated', 0)} 条 · "
+                f"联网 {stats.get('online_updated', 0)}/{stats.get('online_checked', 0)} 条 · 剩余 {stats.get('remaining', 0)} 条"
+                f"{skip_hint}"
+            )
+        mode = "本地规则 + 联网增强" if online_enabled else "本地规则"
+        skipped = int(stats.get("online_skipped", 0) or 0)
+        limit_skipped = int(stats.get("online_limit_skipped", 0) or 0)
+        duplicate_skipped = int(stats.get("online_duplicate_skipped", 0) or 0)
+        no_query = int(stats.get("online_no_query", 0) or 0)
+        disabled = int(stats.get("online_disabled", 0) or 0)
+        skipped_text = ""
+        if skipped or limit_skipped or duplicate_skipped or no_query or disabled:
+            skipped_text = (
+                "\n未联网原因："
+                f"预算到期 {skipped} 条；本次上限 {limit_skipped} 条；"
+                f"重复内容 {duplicate_skipped} 条；标题/域名不足 {no_query} 条；联网关闭 {disabled} 条。"
+                "\n可再次点击继续修复剩余低置信内容。"
+            )
+        QMessageBox.information(
+            self,
+            "修复完成",
+            f"模式：{mode}\n"
+            f"检查内容：{stats.get('checked', 0)} 条\n"
+            f"本地修复：{stats.get('local_updated', 0)} 条\n"
+            f"联网候选：{stats.get('online_candidates', 0)} 条\n"
+            f"联网检查：{stats.get('online_checked', 0)} 条\n"
+            f"联网修复：{stats.get('online_updated', 0)} 条\n"
+            f"剩余低置信：{stats.get('remaining', 0)} 条"
+            f"{skipped_text}",
+        )
+
     def save(self) -> None:
         self.storage.replace_ignored_processes(self.ignored_names())
         self.storage.replace_category_rules(self.category_rule_rows())
@@ -1682,8 +1231,11 @@ class SettingsDialog(QDialog):
         enabled = sum(1 for row in rows if int(row["enabled"]))
         max_count = sum(1 for row in rows if str(row["direction"]) == "max")
         min_count = total - max_count
+        progress = self.storage.goal_progress_range(date.today(), date.today())
+        done = sum(1 for item in progress if bool(item.get("ok")))
         self._set_goal_summary_card(self.goal_total_card, total, f"{min_count} 个至少目标")
         self._set_goal_summary_card(self.goal_enabled_card, enabled, f"{total - enabled} 个暂停")
+        self._set_goal_summary_card(self.goal_progress_card, f"{done}/{len(progress)}", "按今日数据计算")
         self._set_goal_summary_card(self.goal_limit_card, max_count, "控制娱乐/视频等上限")
 
     def _populate_goal_table(self) -> None:
@@ -1695,6 +1247,8 @@ class SettingsDialog(QDialog):
         self.goal_table.blockSignals(False)
         if self.goal_table.rowCount() > 0:
             self.goal_table.selectRow(max(0, min(previous, self.goal_table.rowCount() - 1)))
+        if hasattr(self, "goal_empty_label"):
+            self.goal_empty_label.setVisible(self.goal_table.rowCount() == 0)
         self._update_goal_summary()
 
     def _add_goal_row(self, row_data) -> None:
@@ -1754,6 +1308,15 @@ class SettingsDialog(QDialog):
         self.goal_direction_combo.setCurrentText("至少")
         self.goal_enabled_box.setChecked(True)
         self.goal_name_input.setFocus()
+        self._update_goal_form_hint()
+
+    def _apply_goal_template(self, name: str, metric: str, pattern: str, hours: float, direction: str) -> None:
+        self.goal_name_input.setText(name)
+        self.goal_metric_combo.setCurrentIndex(self._goal_metric_index(metric))
+        self.goal_pattern_input.setText(pattern)
+        self.goal_target_spin.setValue(hours)
+        self.goal_direction_combo.setCurrentText("至少" if direction == "min" else "不超过")
+        self.goal_enabled_box.setChecked(True)
         self._update_goal_form_hint()
 
     def _update_goal_form_hint(self) -> None:
@@ -1843,7 +1406,7 @@ class DiagnosticsDialog(QDialog):
 
         self.setStyleSheet(
             """
-            QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "Noto Sans CJK SC", "Segoe UI", "Arial"; }
+            QDialog { background: #f6f8fb; color: #17202a; font-family: {ui_font_stack()}; }
             QLabel#statsTitle { font-size: 18px; font-weight: 700; }
             QTableWidget, QPlainTextEdit {
                 background: white;
@@ -1860,7 +1423,7 @@ class DiagnosticsDialog(QDialog):
             }
             QPushButton { padding: 6px 10px; border: 1px solid #b9c6d4; border-radius: 6px; background: #ffffff; }
             QPushButton:hover { background: #eef6ff; }
-            """
+            """.replace("{ui_font_stack()}", ui_font_stack())
         )
         self.refresh()
 
@@ -1891,6 +1454,7 @@ class DiagnosticsDialog(QDialog):
         rows = [
             ("数据库路径", str(self.storage.db_path)),
             ("数据库大小", self._format_size(self.storage.database_size_bytes())),
+            ("UI 字体", ui_font_status_text()),
             ("进程日汇总行数", str(db_stats.get("usage_daily_rows", 0))),
             ("内容日汇总行数", str(db_stats.get("content_usage_daily_rows", 0))),
             ("时间线事件行数", str(db_stats.get("timeline_events_rows", 0))),
@@ -1923,6 +1487,7 @@ class DiagnosticsDialog(QDialog):
             ("联网分类来源", self.monitor.category_classifier.last_source or "无"),
             ("联网分类查询", self.monitor.category_classifier.last_query or "无"),
             ("联网分类错误", self.monitor.category_classifier.last_error or "无"),
+            ("联网分类 Provider 错误", self.monitor.category_classifier.last_provider_errors or "无"),
             ("学习主题识别", learning_feature_state(settings)),
             ("学习主题来源", self.monitor.learning_classifier.last_source or "本地规则"),
             ("学习主题查询", self.monitor.learning_classifier.last_query or "无"),
@@ -1940,11 +1505,11 @@ class DiagnosticsDialog(QDialog):
     def _browser_media_detail(self, latest_tab) -> str:
         parts = []
         if getattr(latest_tab, "has_video", False):
-            parts.append("video")
+            parts.append("视频元素")
         if getattr(latest_tab, "has_audio", False):
-            parts.append("audio")
+            parts.append("音频元素")
         if getattr(latest_tab, "muted", False):
-            parts.append("muted")
+            parts.append("已静音")
         state = getattr(latest_tab, "media_state", "") or ""
         if state:
             parts.append(state)
@@ -1971,14 +1536,21 @@ class CurrentStatusDialog(QDialog):
         header = QHBoxLayout()
         title = QLabel("当前状态")
         title.setObjectName("statsTitle")
-        self.category_correction_button = QPushButton("纠正分类")
+        self.last_refresh_label = QLabel("上次刷新：--")
+        self.last_refresh_label.setObjectName("refreshStamp")
+        self.category_correction_button = QPushButton("纠正当前分类")
         self.category_correction_button.setToolTip("把当前网页、视频或前台程序保存为新的分类规则")
         self.category_correction_button.clicked.connect(self.correct_current_category)
+        copy_button = QPushButton("复制诊断信息")
+        copy_button.setToolTip("复制当前状态表格，便于反馈识别问题")
+        copy_button.clicked.connect(self.copy_status_diagnostics)
         refresh_button = QPushButton("刷新")
         refresh_button.clicked.connect(self.refresh)
         header.addWidget(title)
+        header.addWidget(self.last_refresh_label)
         header.addStretch(1)
         header.addWidget(self.category_correction_button)
+        header.addWidget(copy_button)
         header.addWidget(refresh_button)
         root.addLayout(header)
 
@@ -2016,9 +1588,18 @@ class CurrentStatusDialog(QDialog):
 
         self.setStyleSheet(
             """
-            QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "Noto Sans CJK SC", "Segoe UI", "Arial"; }
+            QDialog { background: #f6f8fb; color: #17202a; font-family: {ui_font_stack()}; }
             QLabel#statsTitle { font-size: 18px; font-weight: 700; }
             QLabel#statsNote { color: #607089; }
+            QLabel#refreshStamp {
+                color: #607089;
+                background: #ffffff;
+                border: 1px solid #d9e1ea;
+                border-radius: 8px;
+                padding: 4px 8px;
+                font-size: 12px;
+                font-weight: 650;
+            }
             QTableWidget, QPlainTextEdit {
                 background: white;
                 border: 1px solid #d9e1ea;
@@ -2037,28 +1618,58 @@ class CurrentStatusDialog(QDialog):
             QTabBar::tab:selected { background: #ffffff; border-bottom: 2px solid #1677d2; font-weight: 700; }
             QPushButton { padding: 6px 10px; border: 1px solid #b9c6d4; border-radius: 6px; background: #ffffff; }
             QPushButton:hover { background: #eef6ff; }
-            """
+            """.replace("{ui_font_stack()}", ui_font_stack())
         )
         self.refresh()
 
     def _current_rule_source(self) -> tuple[str, str, str]:
+        candidates = self._current_rule_candidates()
+        if not candidates:
+            return "", "any", ""
+        pattern, target, preview, _description = candidates[0]
+        return pattern, target, preview
+
+    def _current_rule_candidates(self) -> list[tuple[str, str, str, str]]:
+        candidates: list[tuple[str, str, str, str]] = []
+
+        def add(pattern: str, target: str, preview: str, description: str) -> None:
+            clean = pattern.strip().lower()
+            if not clean:
+                return
+            if any(existing_pattern == clean and existing_target == target for existing_pattern, existing_target, _preview, _desc in candidates):
+                return
+            candidates.append((clean, target, preview, description))
+
         latest_tab = self.monitor.browser_bridge.latest(max_age_seconds=3600)
         if latest_tab:
             domain = str(getattr(latest_tab, "domain", "") or "").strip().lower()
             title = cleanup_rule_title(str(getattr(latest_tab, "title", "") or ""))
+            title_hint = "只纠正类似标题/视频，更适合 B 站、YouTube 等同一站点下内容差异很大的平台。"
+            domain_hint = "纠正整个域名，适合普通网站；不适合把 B 站整个域名都归到同一类。"
             if title and (not domain or is_generic_content_domain(domain)):
-                return title.lower(), "title", f"标题：{title}"
-            if domain:
-                return domain, "domain", f"域名：{domain}"
+                add(title, "title", f"标题：{title}", title_hint)
+                if domain:
+                    add(domain, "domain", f"域名：{domain}", domain_hint)
+            else:
+                if domain:
+                    add(domain, "domain", f"域名：{domain}", domain_hint)
+                if title:
+                    add(title, "title", f"标题：{title}", title_hint)
+        if self.monitor.current_video_titles:
+            for title in self.monitor.current_video_titles[:2]:
+                cleaned = cleanup_rule_title(title)
+                add(cleaned, "title", f"播放内容：{cleaned}", "纠正当前播放内容标题，适合单条视频或音乐视频。")
+        if self.monitor.current_media_titles:
+            for title in self.monitor.current_media_titles[:2]:
+                cleaned = cleanup_rule_title(title)
+                add(cleaned, "title", f"媒体标题：{cleaned}", "纠正当前媒体标题，适合单首歌或一次播放内容。")
         if self.monitor.foreground_title:
             title = cleanup_rule_title(self.monitor.foreground_title)
-            if title:
-                return title.lower(), "title", f"窗口标题：{title}"
+            add(title, "title", f"窗口标题：{title}", "纠正相似窗口标题，适合文档、课程页或本地窗口内容。")
         if self.monitor.current_foreground_exe:
             exe = self.monitor.current_foreground_exe.strip().lower()
-            if exe:
-                return exe, "app", f"程序：{exe}"
-        return "", "any", ""
+            add(exe, "app", f"程序：{exe}", "纠正整个本地程序，适合把某个应用长期归为同一分类。")
+        return candidates
 
     def _classification_source_text(self) -> str:
         category = self.monitor.current_category or "无"
@@ -2077,17 +1688,95 @@ class CurrentStatusDialog(QDialog):
         )
         return f"{category} · {detail}"
 
+    def _current_content_type_text(self, latest_tab) -> str:
+        if self.monitor.current_video_titles:
+            return "播放内容（视频/发声标签页）"
+        if self.monitor.current_media_titles:
+            return "音乐/媒体播放"
+        if latest_tab:
+            return "网页注视"
+        if self.monitor.foreground_title:
+            return "窗口标题"
+        return "前台程序"
+
+    def copy_status_diagnostics(self) -> None:
+        lines = []
+        for row in range(self.status_table.rowCount()):
+            name_item = self.status_table.item(row, 0)
+            value_item = self.status_table.item(row, 1)
+            if name_item and value_item:
+                lines.append(f"{name_item.text()}: {value_item.text()}")
+        QApplication.clipboard().setText("\n".join(lines))
+        QMessageBox.information(self, "已复制", "当前状态诊断信息已复制到剪贴板。")
+
     def correct_current_category(self) -> None:
-        pattern, target, preview = self._current_rule_source()
-        if not pattern:
+        candidates = self._current_rule_candidates()
+        if not candidates:
             QMessageBox.information(self, "暂无可纠正内容", "当前没有可用于保存规则的网页、标题或程序。")
             return
-        categories = ["学习", "编程", "AI 工具", "系统软件", "聊天", "游戏", "视频", "音乐", "娱乐", "社交", "办公", "工具", "网站", "购物", "新闻", "其他", "自定义..."]
+        dialog = QDialog(self)
+        dialog.setWindowTitle("纠正当前分类")
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        intro = QLabel("选择新的内容分类，并确认这条规则以后按什么范围生效。")
+        intro.setObjectName("statsNote")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(8)
+        category_combo = QComboBox()
+        category_combo.addItems([*COMMON_CATEGORY_CHOICES, "自定义..."])
         current = self.monitor.current_category or "其他"
-        index = categories.index(current) if current in categories else len(categories) - 2
-        category, ok = QInputDialog.getItem(self, "纠正当前分类", f"{preview}\n以后归为：", categories, index, False)
-        if not ok or not category:
+        category_index = category_combo.findText(current)
+        category_combo.setCurrentIndex(category_index if category_index >= 0 else category_combo.findText("其他"))
+        target_combo = QComboBox()
+        for pattern, target, preview, description in candidates:
+            target_combo.addItem(preview, (pattern, target, preview, description))
+        rule_preview = QLabel("")
+        rule_preview.setObjectName("statsNote")
+        rule_preview.setWordWrap(True)
+
+        def update_preview() -> None:
+            data = target_combo.currentData()
+            if not data:
+                return
+            pattern, target, _preview, description = data
+            category = category_combo.currentText()
+            exists = any(str(row["pattern"]).lower() == pattern for row in self.storage.category_rules())
+            prefix = "将更新已有规则：" if exists else "将添加规则："
+            rule_preview.setText(f"{prefix}{target_label(target)}包含“{pattern}”时归为“{category}”。{description}")
+
+        category_combo.currentIndexChanged.connect(update_preview)
+        target_combo.currentIndexChanged.connect(update_preview)
+        form.addWidget(QLabel("归为"), 0, 0)
+        form.addWidget(category_combo, 0, 1)
+        form.addWidget(QLabel("保存范围"), 1, 0)
+        form.addWidget(target_combo, 1, 1)
+        form.setColumnStretch(1, 1)
+        layout.addLayout(form)
+        layout.addWidget(rule_preview)
+        update_preview()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        if buttons.button(QDialogButtonBox.StandardButton.Save):
+            buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
+        if buttons.button(QDialogButtonBox.StandardButton.Cancel):
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.setStyleSheet(self.styleSheet())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        data = target_combo.currentData()
+        if not data:
+            return
+        pattern, target, preview, _description = data
+        category = category_combo.currentText()
         if category == "自定义...":
             category, ok = QInputDialog.getText(self, "自定义分类", "分类名称：")
             if not ok or not category.strip():
@@ -2102,18 +1791,18 @@ class CurrentStatusDialog(QDialog):
         parent = self.parent()
         if parent is not None and hasattr(parent, "refresh_open_dialogs"):
             QTimer.singleShot(0, parent.refresh_open_dialogs)  # type: ignore[attr-defined]
-        QMessageBox.information(self, "分类规则已保存", f"已添加规则：{target} 包含“{pattern}”时归为“{category}”。")
+        QMessageBox.information(self, "分类规则已保存", f"已保存规则：{target_label(target)}包含“{pattern}”时归为“{category}”。\n\n来源：{preview}")
 
     def _browser_media_detail(self, latest_tab) -> str:
         if not latest_tab:
             return "无"
         parts = []
         if getattr(latest_tab, "has_video", False):
-            parts.append("video")
+            parts.append("视频元素")
         if getattr(latest_tab, "has_audio", False):
-            parts.append("audio")
+            parts.append("音频元素")
         if getattr(latest_tab, "muted", False):
-            parts.append("muted")
+            parts.append("已静音")
         state = getattr(latest_tab, "media_state", "") or ""
         if state:
             parts.append(state)
@@ -2130,6 +1819,7 @@ class CurrentStatusDialog(QDialog):
         self.status_table.resizeColumnsToContents()
 
     def refresh(self) -> None:
+        self.last_refresh_label.setText(f"上次刷新：{datetime.now().strftime('%H:%M:%S')}")
         settings = self.storage.load_settings()
         quality = self.storage.recognition_health_range(date.today(), date.today())
         latest_tab = self.monitor.browser_bridge.latest(max_age_seconds=3600)
@@ -2150,13 +1840,17 @@ class CurrentStatusDialog(QDialog):
             ("记录状态", "已暂停" if self.monitor.is_paused else "记录中"),
             ("小组件模式", "固定展开" if settings.always_expanded else "悬浮折叠/悬停展开"),
             ("隐私模式", "开启" if settings.private_title_mode else "关闭"),
+            ("UI 字体", ui_font_status_text()),
             ("空闲状态", f"{'空闲' if self.monitor.is_idle else '活动'} · {format_duration(self.monitor.idle_seconds)}"),
             ("前台程序", self.monitor.foreground_path or "未识别"),
             ("前台标题", self.monitor.foreground_title[:160] or "无"),
             ("当前网页", latest_web),
-            ("当前内容分类", self.monitor.current_category or "无"),
+            ("内容类型", self._current_content_type_text(latest_tab)),
+            ("内容分类", self.monitor.current_category or "无"),
             ("分类依据", self._classification_source_text()),
+            ("纠正规则候选", self._current_rule_source()[2] or "无"),
             ("最近联网分类", f"{self.monitor.category_classifier.last_source or '无'} · {self.monitor.category_classifier.last_query[:100] if self.monitor.category_classifier.last_query else '无查询'}"),
+            ("联网分类错误", self.monitor.category_classifier.last_error or self.monitor.category_classifier.last_provider_errors or "无"),
             ("网页媒体元素", self._browser_media_detail(latest_tab)),
             ("当前视频", current_video),
             ("当前音乐", current_music),
@@ -2165,7 +1859,7 @@ class CurrentStatusDialog(QDialog):
             ("当前媒体项", f"{len(media_items)} 个"),
             ("浏览器扩展", "最近有活动标签页上报" if latest_tab else "最近无活动标签页上报"),
             ("识别健康度（今天）", quality_summary_text(quality)),
-            ("健康度说明", f"仅域名网页 {quality.get('web_domain_only_rows', 0)} 条；仍归为“视频”的播放 {quality.get('broad_video_rows', 0)} 条；低置信内容 {quality.get('low_confidence_rows', 0)} 条"),
+            ("健康度说明", f"仅域名网页 {quality.get('web_domain_only_rows', 0)} 条；播放内容仍停留在宽泛分类 {quality.get('broad_video_rows', 0)} 条；低置信内容 {quality.get('low_confidence_rows', 0)} 条"),
             ("页面内容信号", f"{self.monitor.browser_bridge.page_signal_count()} 条/小时"),
             ("联网音乐校验", online_feature_state(settings.online_music_lookup, settings.private_title_mode)),
             ("联网分类增强", online_feature_state(settings.online_category_lookup, settings.private_title_mode)),
@@ -2192,6 +1886,10 @@ class StatsDialog(QDialog):
         self._chart_cache_time = 0.0
         self._timeline_limit = 120
         self._timeline_loaded_key = ""
+        self._slow_refresh_timer = QTimer(self)
+        self._slow_refresh_timer.setSingleShot(True)
+        self._slow_refresh_timer.setInterval(300)
+        self._slow_refresh_timer.timeout.connect(self._show_slow_refresh_hint)
         self.setWindowTitle(f"使用数据分析 · v{__version__}")
         self.setWindowIcon(build_app_icon())
         self.setMinimumSize(1020, 720)
@@ -2200,10 +1898,15 @@ class StatsDialog(QDialog):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
-        header_box = QVBoxLayout()
+        header_panel = QFrame()
+        header_panel.setObjectName("statsHeaderPanel")
+        header_box = QVBoxLayout(header_panel)
+        header_box.setContentsMargins(12, 10, 12, 10)
         header_box.setSpacing(8)
         range_row = QHBoxLayout()
+        range_row.setSpacing(8)
         summary_row = QHBoxLayout()
+        summary_row.setSpacing(8)
         title = QLabel("使用数据分析")
         title.setObjectName("statsTitle")
         self.range_combo = QComboBox()
@@ -2216,15 +1919,20 @@ class StatsDialog(QDialog):
         self.range_combo.currentIndexChanged.connect(self._on_range_changed)
         today_qdate = QDate.currentDate()
         self.start_date_edit = QDateEdit(today_qdate)
-        self.start_date_edit.setCalendarPopup(True)
+        self.start_date_edit.setCalendarPopup(False)
         self.start_date_edit.setDisplayFormat("yyyy-MM-dd")
-        self.start_date_edit.setMaximumWidth(118)
+        self.start_date_edit.setMinimumWidth(132)
         self.start_date_edit.dateChanged.connect(self._on_custom_date_changed)
         self.end_date_edit = QDateEdit(today_qdate)
-        self.end_date_edit.setCalendarPopup(True)
+        self.end_date_edit.setCalendarPopup(False)
         self.end_date_edit.setDisplayFormat("yyyy-MM-dd")
-        self.end_date_edit.setMaximumWidth(118)
+        self.end_date_edit.setMinimumWidth(132)
         self.end_date_edit.dateChanged.connect(self._on_custom_date_changed)
+        self._style_date_edit(self.start_date_edit)
+        self._style_date_edit(self.end_date_edit)
+        self.range_picker_button = QPushButton("选择范围")
+        self.range_picker_button.setToolTip("打开更清晰的日期范围选择面板")
+        self.range_picker_button.clicked.connect(self._open_range_picker)
         self._custom_refresh_timer = QTimer(self)
         self._custom_refresh_timer.setSingleShot(True)
         self._custom_refresh_timer.setInterval(180)
@@ -2250,12 +1958,19 @@ class StatsDialog(QDialog):
         self.today_range_button = QPushButton("今天")
         self.today_range_button.setToolTip("回到今天")
         self.today_range_button.clicked.connect(self._jump_to_today_range)
-        report_button = QPushButton("导出报告")
-        report_button.clicked.connect(self.export_report)
-        music_export_button = QPushButton("导出音乐")
-        music_export_button.clicked.connect(self.export_music_csv)
-        learning_export_button = QPushButton("导出学习")
-        learning_export_button.clicked.connect(self.export_learning_csv)
+        export_menu = QMenu(self)
+        report_action = QAction("导出 HTML 报告", self)
+        report_action.triggered.connect(self.export_report)
+        music_export_action = QAction("导出音乐分析 CSV", self)
+        music_export_action.triggered.connect(self.export_music_csv)
+        learning_export_action = QAction("导出学习分析 CSV", self)
+        learning_export_action.triggered.connect(self.export_learning_csv)
+        export_menu.addAction(report_action)
+        export_menu.addAction(music_export_action)
+        export_menu.addAction(learning_export_action)
+        self.export_button = QPushButton("导出")
+        self.export_button.setToolTip("导出当前统计范围的报告或分析 CSV")
+        self.export_button.setMenu(export_menu)
         definition_button = QPushButton("数据口径")
         definition_button.clicked.connect(self.show_data_definitions)
         range_row.addWidget(title)
@@ -2264,6 +1979,7 @@ class StatsDialog(QDialog):
         self.date_separator_label = QLabel("至")
         range_row.addWidget(self.date_separator_label)
         range_row.addWidget(self.end_date_edit)
+        range_row.addWidget(self.range_picker_button)
         range_row.addWidget(self.prev_range_button)
         range_row.addWidget(self.next_range_button)
         range_row.addWidget(self.today_range_button)
@@ -2275,12 +1991,14 @@ class StatsDialog(QDialog):
         summary_row.addWidget(self.video_total)
         summary_row.addWidget(self.media_total)
         summary_row.addWidget(self.detail_status, 1)
-        summary_row.addWidget(music_export_button)
-        summary_row.addWidget(learning_export_button)
-        summary_row.addWidget(report_button)
+        summary_row.addWidget(self.export_button)
         header_box.addLayout(range_row)
+        separator = QFrame()
+        separator.setObjectName("statsHeaderSeparator")
+        separator.setFrameShape(QFrame.Shape.HLine)
+        header_box.addWidget(separator)
         header_box.addLayout(summary_row)
-        root.addLayout(header_box)
+        root.addWidget(header_panel)
         self.range_summary_label = QLabel("当前范围：准备加载")
         self.range_summary_label.setObjectName("rangeSummary")
         self.range_summary_label.setWordWrap(True)
@@ -2297,7 +2015,7 @@ class StatsDialog(QDialog):
         self.trend_tab = self._make_trend_tab()
         self.process_table = self._make_table(["程序", "前台时长", "总运行", "后台", "路径"], sort_column=1)
         self.web_table = self._make_table(["页面标题", "域名", "内容分类", "分类依据", "学习主题", "浏览器", "注视时长", "URL"], sort_column=6)
-        self.video_table = self._make_table(["播放内容", "域名", "内容分类", "分类依据", "学习主题", "播放时长", "URL"], sort_column=5)
+        self.video_table = self._make_table(["播放内容", "内容类型", "域名", "内容分类", "分类依据", "学习主题", "播放时长", "URL"], sort_column=6)
         self.media_table = self._make_table(["播放内容", "内容分类", "分类依据", "来源", "播放时长", "最后记录"], sort_column=4)
         self.music_analysis_table = self._make_table(["歌曲", "歌手", "来源", "播放时长", "占音乐时长", "最后记录"], sort_column=3)
         self.music_analysis_tab = self._make_music_analysis_tab()
@@ -2308,8 +2026,10 @@ class StatsDialog(QDialog):
         self.window_table = self._make_table(["窗口标题", "内容分类", "分类依据", "学习主题", "程序", "注视时长", "最后记录"], sort_column=5)
         self.category_table = self._make_table(["内容分类", "总时长", "占比", "注视时长", "播放/后台", "条目数", "来源类型", "最后记录"], sort_column=1)
         self.goal_table = self._make_table(["目标", "方向", "当前", "目标值", "状态"], sort_column=2)
+        self.goal_tab = self._make_goal_tab()
         self.timeline_table = self._make_table(["开始", "类型", "标题", "应用", "内容分类", "学习主题", "时长"], sort_column=0)
         self.timeline_tab = self._make_timeline_tab()
+        self.timeline_table.itemSelectionChanged.connect(self._update_timeline_detail)
         for table, kind in (
             (self.web_table, "web"),
             (self.video_table, "video"),
@@ -2319,7 +2039,7 @@ class StatsDialog(QDialog):
             self._install_category_menu(table, kind)
         # Domain and video-domain tables (created here, populated later)
         self.domain_table = self._make_table(["网站域名", "浏览时长", "网页数", "主要页面", "最后访问"], 1)
-        self.video_domain_table = self._make_table(["播放来源", "播放时长", "视频数", "主要内容", "主要分类", "最后播放"], 1)
+        self.video_domain_table = self._make_table(["播放来源", "播放时长", "条目数", "主要内容", "分类分布", "最后播放"], 1)
 
         # --- Merged tabs: 程序, 网页, 视频, 音乐 ---
         self.programs_tab = self._make_merged_tab(
@@ -2331,8 +2051,8 @@ class StatsDialog(QDialog):
             "网站排行", self.domain_table,
         )
         self.video_tab = self._make_merged_tab(
-            "视频播放内容", self.video_table,
-            "播放来源", self.video_domain_table,
+            "播放内容（类型=视频播放，分类=学习/游戏/音乐等细分）", self.video_table,
+            "播放来源与分类分布", self.video_domain_table,
         )
         self.music_tab = QWidget()
         music_layout = QVBoxLayout(self.music_tab)
@@ -2350,25 +2070,35 @@ class StatsDialog(QDialog):
         self.tabs.addTab(self.trend_tab, "趋势")
         self.tabs.addTab(self.programs_tab, "程序")
         self.tabs.addTab(self.web_tab, "网页")
-        self.tabs.addTab(self.video_tab, "视频")
+        self.tabs.addTab(self.video_tab, "播放")
         self.tabs.addTab(self.music_tab, "音乐")
         self.tabs.addTab(self.learning_analysis_tab, "学习")
         self.tabs.addTab(self.category_table, "分类")
-        self.tabs.addTab(self.goal_table, "目标")
+        self.tabs.addTab(self.goal_tab, "目标")
         self.tabs.addTab(self.timeline_tab, "时间线")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
 
-        note = QLabel("网页注视和窗口标题统计的是前台焦点；音乐播放统计的是后台播放内容。网页、视频、音乐和窗口表格可右键纠正分类规则。")
+        note = QLabel("网页注视和窗口标题统计的是前台焦点；播放页里的“内容类型”表示视频/发声标签页，“内容分类”表示学习、游戏、音乐等细分。可用“纠正选中”或右键保存分类规则。")
         note.setObjectName("statsNote")
         note.setWordWrap(True)
         root.addWidget(note)
 
         self.setStyleSheet(
             """
-            QDialog { background: #f6f8fb; color: #17202a; font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "Noto Sans CJK SC", "Segoe UI", "Arial"; }
+            QDialog { background: #f6f8fb; color: #17202a; font-family: {ui_font_stack()}; }
             QLabel#statsTitle { font-size: 18px; font-weight: 700; }
             QLabel#statsNote { color: #607089; }
+            QFrame#statsHeaderPanel {
+                background: #ffffff;
+                border: 1px solid #d9e1ea;
+                border-radius: 10px;
+            }
+            QFrame#statsHeaderSeparator {
+                color: #e8eef5;
+                background: #e8eef5;
+                max-height: 1px;
+            }
             QLabel#mergedSectionHeader {
                 color: #334155;
                 font-size: 13px;
@@ -2413,6 +2143,18 @@ class StatsDialog(QDialog):
                 padding: 7px 10px;
                 font-weight: 650;
             }
+            QDateEdit#dateRangeEdit {
+                padding: 6px 10px;
+                border: 1px solid #b9c6d4;
+                border-radius: 8px;
+                background: #ffffff;
+                color: #0f172a;
+                font-weight: 650;
+            }
+            QDateEdit#dateRangeEdit:focus {
+                border-color: #1677d2;
+                background: #f8fbff;
+            }
             QFrame#dataTools {
                 background: #ffffff;
                 border: 1px solid #d9e1ea;
@@ -2453,6 +2195,35 @@ class StatsDialog(QDialog):
                 color: #607089;
                 padding: 3px 4px;
             }
+            QFrame#timelineQueryPanel {
+                background: #ffffff;
+                border: 1px solid #d9e1ea;
+                border-radius: 8px;
+            }
+            QFrame#goalDashboard {
+                background: #ffffff;
+                border: 1px solid #d9e1ea;
+                border-radius: 10px;
+            }
+            QLabel#goalHint {
+                color: #475569;
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 8px 10px;
+                font-weight: 650;
+            }
+            QLabel#timelineQueryTitle {
+                color: #334155;
+                font-weight: 750;
+            }
+            QPlainTextEdit#timelineDetail {
+                background: #f8fafc;
+                border: 1px solid #d9e1ea;
+                border-radius: 8px;
+                color: #334155;
+                padding: 8px;
+            }
             QLabel { color: #17202a; }
             QComboBox { padding: 6px 10px; border: 1px solid #b9c6d4; border-radius: 6px; background: #ffffff; }
             QPushButton { padding: 6px 10px; border: 1px solid #b9c6d4; border-radius: 6px; background: #ffffff; }
@@ -2481,10 +2252,204 @@ class StatsDialog(QDialog):
                 padding: 6px;
                 font-weight: 650;
             }
-            """
+            """.replace("{ui_font_stack()}", ui_font_stack())
         )
+        self._install_shortcuts()
         self._sync_custom_date_controls()
         QTimer.singleShot(0, self.refresh)
+
+    def _install_shortcuts(self) -> None:
+        self._shortcuts = [
+            QShortcut(QKeySequence("Ctrl+F"), self, activated=self._focus_timeline_search),
+            QShortcut(QKeySequence("Ctrl+D"), self, activated=self._jump_to_today_range),
+            QShortcut(QKeySequence("Ctrl+Left"), self, activated=lambda: self._shift_date_range(-1)),
+            QShortcut(QKeySequence("Ctrl+Right"), self, activated=lambda: self._shift_date_range(1)),
+            QShortcut(QKeySequence("Escape"), self, activated=self.close),
+        ]
+
+    def _focus_timeline_search(self) -> None:
+        self.tabs.setCurrentWidget(self.timeline_tab)
+        self.timeline_search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.timeline_search_input.selectAll()
+
+    def _style_date_edit(self, edit: QDateEdit) -> None:
+        edit.setObjectName("dateRangeEdit")
+        edit.setCalendarPopup(False)
+        edit.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        edit.setMinimumDate(QDate(2000, 1, 1))
+        edit.setMaximumDate(QDate.currentDate())
+        edit.setToolTip("直接输入 yyyy-MM-dd，或点击右侧“选择范围”打开日期面板")
+        calendar = edit.calendarWidget()
+        if calendar is not None:
+            calendar.setGridVisible(True)
+            calendar.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+            calendar.setStyleSheet(
+                """
+                QCalendarWidget {
+                    background: #ffffff;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 8px;
+                }
+                QCalendarWidget QWidget#qt_calendar_navigationbar {
+                    background: #eef6ff;
+                    border-bottom: 1px solid #cfe4ff;
+                }
+                QCalendarWidget QToolButton {
+                    color: #0f172a;
+                    background: transparent;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 5px 8px;
+                    font-weight: 700;
+                }
+                QCalendarWidget QToolButton:hover { background: #dbeafe; }
+                QCalendarWidget QMenu { background: #ffffff; border: 1px solid #cbd5e1; }
+                QCalendarWidget QSpinBox {
+                    background: #ffffff;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 6px;
+                    padding: 3px 6px;
+                }
+                QCalendarWidget QAbstractItemView {
+                    outline: 0;
+                    selection-background-color: #1677d2;
+                    selection-color: #ffffff;
+                    color: #0f172a;
+                    background: #ffffff;
+                    alternate-background-color: #f8fafc;
+                }
+                """
+            )
+
+    def _open_range_picker(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("选择日期范围")
+        dialog.setMinimumSize(760, 470)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        quick_row = QHBoxLayout()
+        quick_row.setSpacing(8)
+        quick_label = QLabel("快捷范围")
+        quick_label.setObjectName("rangePickerLabel")
+        quick_row.addWidget(quick_label)
+        for label, days in (("今天", 1), ("最近 7 天", 7), ("最近 30 天", 30)):
+            btn = QPushButton(label)
+            btn.setObjectName("subtleButton")
+            btn.clicked.connect(lambda _checked=False, d=days: self._set_picker_days(start_cal, end_cal, d))
+            quick_row.addWidget(btn)
+        quick_row.addStretch(1)
+        layout.addLayout(quick_row)
+
+        calendars = QHBoxLayout()
+        calendars.setSpacing(12)
+        start_box = QVBoxLayout()
+        end_box = QVBoxLayout()
+        start_label = QLabel("开始日期")
+        end_label = QLabel("结束日期")
+        start_label.setObjectName("rangePickerLabel")
+        end_label.setObjectName("rangePickerLabel")
+        start_cal = QCalendarWidget()
+        end_cal = QCalendarWidget()
+        for cal in (start_cal, end_cal):
+            cal.setGridVisible(True)
+            cal.setMaximumDate(QDate.currentDate())
+            cal.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+            cal.setStyleSheet(self._calendar_style_sheet())
+        start_cal.setSelectedDate(self.start_date_edit.date())
+        end_cal.setSelectedDate(self.end_date_edit.date())
+        start_box.addWidget(start_label)
+        start_box.addWidget(start_cal)
+        end_box.addWidget(end_label)
+        end_box.addWidget(end_cal)
+        calendars.addLayout(start_box, 1)
+        calendars.addLayout(end_box, 1)
+        layout.addLayout(calendars, 1)
+
+        preview = QLabel()
+        preview.setObjectName("rangePickerPreview")
+        preview.setWordWrap(True)
+        layout.addWidget(preview)
+
+        def update_preview() -> None:
+            start = self._qdate_to_date(start_cal.selectedDate())
+            end = self._qdate_to_date(end_cal.selectedDate())
+            if end < start:
+                start, end = end, start
+            days = (end - start).days + 1
+            preview.setText(f"已选：{start.isoformat()} 至 {end.isoformat()} · 共 {days} 天")
+
+        start_cal.selectionChanged.connect(update_preview)
+        end_cal.selectionChanged.connect(update_preview)
+        update_preview()
+
+        hint = QLabel("选择后会切换到“自定义”范围。若结束日期早于开始日期，软件会自动交换。为避免误触，日期输入框不再弹出遮挡界面的下拉日历。")
+        hint.setObjectName("rangePickerHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.setStyleSheet(
+            """
+            QDialog { background: #f6f8fb; color: #17202a; font-family: {ui_font_stack()}; }
+            QLabel#rangePickerLabel { color: #0f172a; font-weight: 800; padding: 2px 0; }
+            QLabel#rangePickerPreview { color: #1d4ed8; background: #eef6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 8px 10px; font-weight: 750; }
+            QLabel#rangePickerHint { color: #64748b; background: #ffffff; border: 1px solid #d9e1ea; border-radius: 8px; padding: 8px 10px; }
+            QPushButton { padding: 6px 10px; border: 1px solid #b9c6d4; border-radius: 7px; background: #ffffff; }
+            QPushButton:hover { background: #eef6ff; }
+            QPushButton#subtleButton { background: #f8fafc; color: #334155; border-color: #d9e1ea; }
+            """.replace("{ui_font_stack()}", ui_font_stack())
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._set_custom_date_range(self._qdate_to_date(start_cal.selectedDate()), self._qdate_to_date(end_cal.selectedDate()))
+
+    def _set_picker_days(self, start_cal: QCalendarWidget, end_cal: QCalendarWidget, days: int) -> None:
+        end = QDate.currentDate()
+        start = end.addDays(-(max(1, days) - 1))
+        start_cal.setSelectedDate(start)
+        end_cal.setSelectedDate(end)
+
+    @staticmethod
+    def _calendar_style_sheet() -> str:
+        return """
+            QCalendarWidget {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+            }
+            QCalendarWidget QWidget#qt_calendar_navigationbar {
+                background: #eef6ff;
+                border-bottom: 1px solid #cfe4ff;
+            }
+            QCalendarWidget QToolButton {
+                color: #0f172a;
+                background: transparent;
+                border: none;
+                border-radius: 6px;
+                padding: 5px 8px;
+                font-weight: 700;
+            }
+            QCalendarWidget QToolButton:hover { background: #dbeafe; }
+            QCalendarWidget QMenu { background: #ffffff; border: 1px solid #cbd5e1; }
+            QCalendarWidget QSpinBox {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 3px 6px;
+            }
+            QCalendarWidget QAbstractItemView {
+                outline: 0;
+                selection-background-color: #1677d2;
+                selection-color: #ffffff;
+                color: #0f172a;
+                background: #ffffff;
+                alternate-background-color: #f8fafc;
+            }
+        """
 
     def _make_chart_panel(self, chart: QWidget) -> QFrame:
         panel = QFrame()
@@ -2512,11 +2477,11 @@ class StatsDialog(QDialog):
         # Row 1: Learning spotlight (prominent)
         learn_row = QHBoxLayout()
         learn_row.setSpacing(10)
-        self.learning_today_card = StatCard("学习总时长", "#55b88d")
+        self.learning_today_card = StatCard("学习总时长", app_color("learn"))
         self.learning_today_card.setMinimumHeight(100)
         learn_row.addWidget(self.learning_today_card, 2)
-        self.focus_card = StatCard("前台注视", "#1677d2")
-        self.web_card = StatCard("网页注视", "#4a90c4")
+        self.focus_card = StatCard("前台注视", app_color("focus"))
+        self.web_card = StatCard("网页注视", app_color("web"))
         learn_row.addWidget(self.focus_card, 1)
         learn_row.addWidget(self.web_card, 1)
         layout.addLayout(learn_row)
@@ -2524,15 +2489,15 @@ class StatsDialog(QDialog):
         # Row 2: Secondary metrics
         sec_row = QHBoxLayout()
         sec_row.setSpacing(10)
-        self.video_card = StatCard("视频播放", "#f0a33a")
-        self.music_card = StatCard("音乐播放", "#d95f76")
+        self.video_card = StatCard("视频播放", app_color("video"))
+        self.music_card = StatCard("音乐播放", app_color("music"))
         sec_row.addWidget(self.video_card, 1)
         sec_row.addWidget(self.music_card, 1)
         layout.addLayout(sec_row)
 
         self.streak_label = QLabel("")
         self.streak_label.setObjectName("streakLabel")
-        self.streak_label.setStyleSheet("color: #f0a33a; font-size: 13px; font-weight: 700; padding: 4px 10px; background: #fff8e6; border-radius: 6px;")
+        self.streak_label.setStyleSheet(f"color: {app_color('video')}; font-size: 13px; font-weight: 700; padding: 4px 10px; background: #fff8e6; border-radius: 6px;")
         self.streak_label.setVisible(False)
         layout.addWidget(self.streak_label)
 
@@ -2564,7 +2529,7 @@ class StatsDialog(QDialog):
         layout.setSpacing(12)
 
         layout.addWidget(self._section_label("本周对比"))
-        self.line_chart = LineChartWidget("本周 vs 上周")
+        self.line_chart = GroupedBarChartWidget("本周 vs 上周")
         self.line_metric_combo = QComboBox()
         self.line_metric_combo.addItems(["前台注视", "视频播放", "音乐播放", "学习"])
         self.line_metric_combo.setMaximumWidth(120)
@@ -2618,9 +2583,9 @@ class StatsDialog(QDialog):
         summary_layout = QHBoxLayout(summary)
         summary_layout.setContentsMargins(10, 8, 10, 8)
         summary_layout.setSpacing(10)
-        self.music_analysis_total = StatCard("音乐总时长", "#d95f76")
-        self.music_analysis_count = StatCard("去重歌曲", "#55b88d")
-        self.music_analysis_top = StatCard("最常听", "#1677d2")
+        self.music_analysis_total = StatCard("音乐总时长", app_color("music"))
+        self.music_analysis_count = StatCard("去重歌曲", app_color("learn"))
+        self.music_analysis_top = StatCard("最常听", app_color("focus"))
         for card in (self.music_analysis_total, self.music_analysis_count, self.music_analysis_top):
             summary_layout.addWidget(card, 1)
         layout.addWidget(summary)
@@ -2637,9 +2602,9 @@ class StatsDialog(QDialog):
         summary_layout = QHBoxLayout(summary)
         summary_layout.setContentsMargins(10, 8, 10, 8)
         summary_layout.setSpacing(10)
-        self.artist_analysis_total = StatCard("歌手总时长", "#d95f76")
+        self.artist_analysis_total = StatCard("歌手总时长", app_color("music"))
         self.artist_analysis_count = StatCard("去重歌手", "#8b72d9")
-        self.artist_analysis_top = StatCard("最爱歌手", "#1677d2")
+        self.artist_analysis_top = StatCard("最爱歌手", app_color("focus"))
         for card in (self.artist_analysis_total, self.artist_analysis_count, self.artist_analysis_top):
             summary_layout.addWidget(card, 1)
         layout.addWidget(summary)
@@ -2656,13 +2621,37 @@ class StatsDialog(QDialog):
         summary_layout = QHBoxLayout(summary)
         summary_layout.setContentsMargins(10, 8, 10, 8)
         summary_layout.setSpacing(10)
-        self.learning_analysis_total = StatCard("学习总时长", "#1677d2")
-        self.learning_analysis_count = StatCard("去重主题数", "#55b88d")
-        self.learning_analysis_top = StatCard("最常学主题", "#f0a33a")
+        self.learning_analysis_total = StatCard("学习总时长", app_color("focus"))
+        self.learning_analysis_count = StatCard("去重主题数", app_color("learn"))
+        self.learning_analysis_top = StatCard("最常学主题", app_color("video"))
         for card in (self.learning_analysis_total, self.learning_analysis_count, self.learning_analysis_top):
             summary_layout.addWidget(card, 1)
         layout.addWidget(summary)
         layout.addWidget(self.learning_analysis_table, 1)
+        return tab
+
+    def _make_goal_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+        summary = QFrame()
+        summary.setObjectName("goalDashboard")
+        summary_layout = QHBoxLayout(summary)
+        summary_layout.setContentsMargins(10, 8, 10, 8)
+        summary_layout.setSpacing(10)
+        self.goal_done_card = StatCard("达标", app_color("success"))
+        self.goal_close_card = StatCard("接近", app_color("warning"))
+        self.goal_missed_card = StatCard("未达标", app_color("danger"))
+        for card in (self.goal_done_card, self.goal_close_card, self.goal_missed_card):
+            card.setMinimumHeight(96)
+            summary_layout.addWidget(card, 1)
+        layout.addWidget(summary)
+        self.goal_hint_label = QLabel("目标按当前日期范围计算；“接近”表示进度达到 70% 以上。可到设置 > 学习目标中调整目标。")
+        self.goal_hint_label.setObjectName("goalHint")
+        self.goal_hint_label.setWordWrap(True)
+        layout.addWidget(self.goal_hint_label)
+        layout.addWidget(self.goal_table, 1)
         return tab
 
     def _make_timeline_tab(self) -> QWidget:
@@ -2670,17 +2659,124 @@ class StatsDialog(QDialog):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
-        header = QHBoxLayout()
-        self.timeline_hint = QLabel("时间线按需加载，默认只显示最近 120 条，避免大量历史事件导致界面卡顿。")
-        self.timeline_hint.setObjectName("timelineHint")
+
+        query_panel = QFrame()
+        query_panel.setObjectName("timelineQueryPanel")
+        query_layout = QGridLayout(query_panel)
+        query_layout.setContentsMargins(10, 8, 10, 8)
+        query_layout.setHorizontalSpacing(8)
+        query_layout.setVerticalSpacing(6)
+
+        title = QLabel("历史查询")
+        title.setObjectName("timelineQueryTitle")
+        self.timeline_search_input = QLineEdit()
+        self.timeline_search_input.setPlaceholderText("搜索标题 / 应用 / 分类 / 学习主题")
+        self.timeline_search_input.setClearButtonEnabled(True)
+        self.timeline_kind_filter = QComboBox()
+        for label, value in (
+            ("全部类型", ""),
+            ("网页", "web_page"),
+            ("窗口", "window_title"),
+            ("视频", "video_playback"),
+            ("音乐", "media_playback"),
+            ("空闲", "idle"),
+        ):
+            self.timeline_kind_filter.addItem(label, value)
+        self.timeline_sort_combo = QComboBox()
+        self.timeline_sort_combo.addItem("最近优先", "recent")
+        self.timeline_sort_combo.addItem("时长最长", "duration")
+        self.timeline_sort_combo.addItem("最早优先", "oldest")
+        self.timeline_min_minutes_spin = QSpinBox()
+        self.timeline_min_minutes_spin.setRange(0, 1440)
+        self.timeline_min_minutes_spin.setSuffix(" 分钟+")
+        self.timeline_min_minutes_spin.setToolTip("只显示单条持续时长不低于该值的记录；0 表示不限。")
+        query_button = QPushButton("查询")
+        query_button.clicked.connect(self._refresh_timeline_query)
         self.timeline_more_button = QPushButton("加载更多")
         self.timeline_more_button.setToolTip("每次增加 200 条时间线记录")
         self.timeline_more_button.clicked.connect(self._load_more_timeline)
-        header.addWidget(self.timeline_hint, 1)
-        header.addWidget(self.timeline_more_button)
-        layout.addLayout(header)
+
+        self.timeline_query_timer = QTimer(self)
+        self.timeline_query_timer.setSingleShot(True)
+        self.timeline_query_timer.setInterval(220)
+        self.timeline_query_timer.timeout.connect(self._refresh_timeline_query)
+        self.timeline_search_input.textChanged.connect(self._schedule_timeline_query_refresh)
+        self.timeline_search_input.returnPressed.connect(self._refresh_timeline_query)
+        self.timeline_kind_filter.currentIndexChanged.connect(self._refresh_timeline_query)
+        self.timeline_sort_combo.currentIndexChanged.connect(self._refresh_timeline_query)
+        self.timeline_min_minutes_spin.valueChanged.connect(self._refresh_timeline_query)
+
+        self.timeline_hint = QLabel("按当前日期范围查询历史事件；关键词会匹配标题、应用、分类和学习主题。")
+        self.timeline_hint.setObjectName("timelineHint")
+        self.timeline_detail = QPlainTextEdit()
+        self.timeline_detail.setObjectName("timelineDetail")
+        self.timeline_detail.setReadOnly(True)
+        self.timeline_detail.setMaximumHeight(104)
+        self.timeline_detail.setPlainText("选择一条历史记录查看详情。")
+
+        query_layout.addWidget(title, 0, 0)
+        query_layout.addWidget(self.timeline_search_input, 0, 1, 1, 3)
+        query_layout.addWidget(self.timeline_kind_filter, 0, 4)
+        query_layout.addWidget(self.timeline_sort_combo, 0, 5)
+        query_layout.addWidget(self.timeline_min_minutes_spin, 0, 6)
+        query_layout.addWidget(query_button, 0, 7)
+        query_layout.addWidget(self.timeline_more_button, 0, 8)
+        query_layout.addWidget(self.timeline_hint, 1, 0, 1, 9)
+        query_layout.setColumnStretch(1, 1)
+
+        layout.addWidget(query_panel)
         layout.addWidget(self.timeline_table, 1)
+        layout.addWidget(self.timeline_detail)
         return tab
+
+    def _timeline_search_text(self) -> str:
+        return self.timeline_search_input.text().strip() if hasattr(self, "timeline_search_input") else ""
+
+    def _timeline_kind_value(self) -> str:
+        return str(self.timeline_kind_filter.currentData() or "") if hasattr(self, "timeline_kind_filter") else ""
+
+    def _timeline_sort_value(self) -> str:
+        return str(self.timeline_sort_combo.currentData() or "recent") if hasattr(self, "timeline_sort_combo") else "recent"
+
+    def _timeline_min_seconds(self) -> float:
+        return float(self.timeline_min_minutes_spin.value() * 60) if hasattr(self, "timeline_min_minutes_spin") else 0.0
+
+    def _schedule_timeline_query_refresh(self) -> None:
+        if hasattr(self, "timeline_query_timer"):
+            self.timeline_query_timer.start()
+
+    def _refresh_timeline_query(self) -> None:
+        if hasattr(self, "timeline_query_timer"):
+            self.timeline_query_timer.stop()
+        self._timeline_limit = 120
+        self._timeline_loaded_key = ""
+        if hasattr(self, "tabs") and self._is_timeline_tab_active():
+            self.refresh()
+
+    def _update_timeline_detail(self) -> None:
+        if not hasattr(self, "timeline_detail") or not hasattr(self, "timeline_table"):
+            return
+        row = self.timeline_table.currentRow()
+        if row < 0:
+            self.timeline_detail.setPlainText("选择一条历史记录查看详情。")
+            return
+        values = {}
+        for col in range(self.timeline_table.columnCount()):
+            header_item = self.timeline_table.horizontalHeaderItem(col)
+            item = self.timeline_table.item(row, col)
+            if header_item and item:
+                values[header_item.text()] = item.text()
+        self.timeline_detail.setPlainText(
+            "开始：{start}\n类型：{kind}\n标题：{title}\n应用：{app}\n分类：{category} · 学习主题：{topic}\n时长：{duration}".format(
+                start=values.get("开始", ""),
+                kind=values.get("类型", ""),
+                title=values.get("标题", ""),
+                app=values.get("应用", ""),
+                category=values.get("内容分类", ""),
+                topic=values.get("学习主题", ""),
+                duration=values.get("时长", ""),
+            )
+        )
 
     def _make_data_tools(self) -> QFrame:
         panel = QFrame()
@@ -2709,6 +2805,10 @@ class StatsDialog(QDialog):
         self.low_confidence_only_box.setToolTip("只显示分类依据为低置信、兜底分类，或仍停留在宽泛分类的行")
         self.low_confidence_only_box.toggled.connect(self._apply_data_filters)
 
+        self.correct_selected_button = QPushButton("纠正选中")
+        self.correct_selected_button.setToolTip("为当前选中行添加可记住的分类规则")
+        self.correct_selected_button.clicked.connect(self.correct_selected_category)
+
         clear_button = QPushButton("清空")
         clear_button.setToolTip("清空搜索、分类和低置信筛选")
         clear_button.clicked.connect(self._clear_data_filters)
@@ -2721,6 +2821,7 @@ class StatsDialog(QDialog):
         layout.addWidget(self.data_search_input, 1)
         layout.addWidget(self.data_category_filter)
         layout.addWidget(self.low_confidence_only_box)
+        layout.addWidget(self.correct_selected_button)
         layout.addWidget(clear_button)
         layout.addWidget(self.data_filter_status)
         return panel
@@ -2781,10 +2882,10 @@ class StatsDialog(QDialog):
             return [self.learning_analysis_table]
         if active is self.category_table:
             return [self.category_table]
-        if active is self.goal_table:
+        if active is self.goal_tab:
             return [self.goal_table]
         if self._is_timeline_tab_active():
-            return [self.timeline_table]
+            return []
         return []
 
     def _header_texts(self, table: QTableWidget) -> list[str]:
@@ -2796,7 +2897,7 @@ class StatsDialog(QDialog):
 
     def _category_column(self, table: QTableWidget) -> int:
         for index, header in enumerate(self._header_texts(table)):
-            if header in {"内容分类", "分类", "主要分类"}:
+            if header in {"内容分类", "分类", "主要分类", "分类分布"}:
                 return index
         return -1
 
@@ -2829,17 +2930,6 @@ class StatsDialog(QDialog):
         reason_col = self._classification_column(table)
         if category_col < 0 and reason_col < 0:
             return
-        category_colors = {
-            "学习": "#14532d",
-            "编程": "#075985",
-            "AI 工具": "#5b21b6",
-            "游戏": "#7c2d12",
-            "音乐": "#9d174d",
-            "娱乐": "#854d0e",
-            "聊天": "#155e75",
-            "办公": "#334155",
-            "系统软件": "#475569",
-        }
         for row in range(table.rowCount()):
             reason = table.item(row, reason_col).text() if reason_col >= 0 and table.item(row, reason_col) else ""
             for col in range(table.columnCount()):
@@ -2864,9 +2954,7 @@ class StatsDialog(QDialog):
             if category_col >= 0:
                 item = table.item(row, category_col)
                 if item:
-                    color = category_colors.get(item.text().strip())
-                    if color:
-                        item.setForeground(QBrush(QColor(color)))
+                    item.setForeground(QBrush(QColor(category_color(item.text().strip()))))
             if reason_col >= 0:
                 item = table.item(row, reason_col)
                 if item:
@@ -2890,6 +2978,7 @@ class StatsDialog(QDialog):
         has_category, has_reason = self._data_filter_capabilities(tables)
         self.data_category_filter.setEnabled(has_category)
         self.low_confidence_only_box.setEnabled(has_category or has_reason)
+        self.correct_selected_button.setEnabled(bool(tables))
         if not has_category and self.data_category_filter.currentIndex() != 0:
             self.data_category_filter.blockSignals(True)
             self.data_category_filter.setCurrentIndex(0)
@@ -2965,16 +3054,48 @@ class StatsDialog(QDialog):
         table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         table.customContextMenuRequested.connect(lambda pos, current=table, table_kind=kind: self._show_category_menu(current, table_kind, pos))
 
+    def correct_selected_category(self) -> None:
+        active = self.tabs.currentWidget()
+        targets = [
+            (self.web_table, "web"),
+            (self.video_table, "video"),
+            (self.media_table, "media"),
+            (self.window_table, "window"),
+        ]
+        if active is self.web_tab:
+            targets = [(self.web_table, "web")]
+        elif active is self.video_tab:
+            targets = [(self.video_table, "video")]
+        elif active is self.music_tab:
+            targets = [(self.media_table, "media")]
+        elif active is self.programs_tab:
+            targets = [(self.window_table, "window")]
+        for table, kind in targets:
+            row = table.currentRow()
+            if row >= 0 and not table.isRowHidden(row):
+                row_rect = table.visualItemRect(table.item(row, 0)) if table.item(row, 0) else table.visualRect(table.model().index(row, 0))
+                pos = row_rect.center() if row_rect.isValid() else QPoint(12, 12)
+                self._prompt_category_for_row(table, kind, row, pos)
+                return
+        QMessageBox.information(self, "请选择一行", "请先在网页、播放内容、音乐或窗口表格中选中一条记录。")
+
     def _show_category_menu(self, table: QTableWidget, kind: str, pos: QPoint) -> None:
         row = table.rowAt(pos.y())
         if row < 0:
             return
         table.selectRow(row)
+        self._prompt_category_for_row(table, kind, row, pos)
+
+    def _prompt_category_for_row(self, table: QTableWidget, kind: str, row: int, pos: QPoint | None = None) -> None:
         pattern, target = self._category_rule_source(table, kind, row)
         if not pattern:
             return
         menu = QMenu(self)
-        for category in ("学习", "编程", "AI 工具", "系统软件", "聊天", "游戏", "视频", "音乐", "娱乐", "社交", "办公", "工具", "网站", "购物", "新闻", "其他"):
+        summary = QAction(f"保存范围：{target_label(target)}包含“{pattern}”", self)
+        summary.setEnabled(False)
+        menu.addAction(summary)
+        menu.addSeparator()
+        for category in COMMON_CATEGORY_CHOICES:
             action = QAction(f"以后归为：{category}", self)
             action.triggered.connect(lambda _checked=False, cat=category: self._apply_category_correction(table, pattern, target, cat))
             menu.addAction(action)
@@ -2982,16 +3103,24 @@ class StatsDialog(QDialog):
         custom_action = QAction("输入自定义分类...", self)
         custom_action.triggered.connect(lambda: self._prompt_category_correction(table, pattern, target))
         menu.addAction(custom_action)
-        menu.exec(table.viewport().mapToGlobal(pos))
+        menu.exec(table.viewport().mapToGlobal(pos or QPoint(12, 12)))
 
     def _cell_text(self, table: QTableWidget, row: int, col: int) -> str:
         item = table.item(row, col)
         return item.text().strip() if item else ""
 
     def _category_rule_source(self, table: QTableWidget, kind: str, row: int) -> tuple[str, str]:
-        if kind in {"web", "video"}:
+        if kind == "web":
             domain = self._cell_text(table, row, 1).lower()
             title = self._cell_text(table, row, 0).lower()
+            if domain and is_generic_content_domain(domain) and title:
+                return title[:120], "title"
+            return (domain, "domain") if domain else (title[:80], "title")
+        if kind == "video":
+            domain = self._cell_text(table, row, 2).lower()
+            title = self._cell_text(table, row, 0).lower()
+            if title and (not domain or is_generic_content_domain(domain)):
+                return title[:120], "title"
             return (domain, "domain") if domain else (title[:80], "title")
         if kind == "media":
             source = self._cell_text(table, row, 3).lower()
@@ -3006,7 +3135,11 @@ class StatsDialog(QDialog):
         return "", "any"
 
     def _apply_category_correction(self, table: QTableWidget, pattern: str, target: str, category: str) -> None:
-        self.storage.add_category_rule(pattern, category, target, update_existing=True)
+        try:
+            self.storage.add_category_rule(pattern, category, target, update_existing=True)
+        except Exception as exc:
+            show_operation_error(self, "保存分类规则失败", exc)
+            return
         self.refresh()
         parent = self.parent()
         if parent is not None and hasattr(parent, "refresh_open_dialogs"):
@@ -3014,7 +3147,7 @@ class StatsDialog(QDialog):
         QMessageBox.information(
             self,
             "分类规则已保存",
-            f"已添加规则：{target} 包含“{pattern}”时归为“{category}”。",
+            f"已保存规则：{target_label(target)}包含“{pattern}”时归为“{category}”。",
         )
 
     def _prompt_category_correction(self, table: QTableWidget, pattern: str, target: str) -> None:
@@ -3030,7 +3163,7 @@ class StatsDialog(QDialog):
         labels = {
             "web_page": "网页",
             "window_title": "窗口",
-            "video_playback": "视频",
+            "video_playback": "播放内容",
             "media_playback": "音乐",
             "idle": "空闲",
         }
@@ -3051,6 +3184,8 @@ class StatsDialog(QDialog):
             table.clearContents()
             table.setRowCount(len(rows))
             for row_index, row_values in enumerate(rows):
+                if row_index and row_index % 250 == 0:
+                    QApplication.processEvents()
                 for col_index, value in enumerate(row_values):
                     sort_value = None
                     text = value
@@ -3159,7 +3294,11 @@ class StatsDialog(QDialog):
 
     def _date_range_key(self) -> str:
         start_date, end_date = self._current_date_range()
-        return f"{start_date.isoformat()}:{end_date.isoformat()}:{self._timeline_limit}"
+        return (
+            f"{start_date.isoformat()}:{end_date.isoformat()}:{self._timeline_limit}:"
+            f"{self._timeline_search_text()}:{self._timeline_kind_value()}:"
+            f"{self._timeline_sort_value()}:{self._timeline_min_seconds()}"
+        )
 
     def _is_timeline_tab_active(self) -> bool:
         return self.tabs.currentWidget() is self.timeline_tab
@@ -3169,7 +3308,7 @@ class StatsDialog(QDialog):
         QTimer.singleShot(0, self.refresh)
 
     def _load_more_timeline(self) -> None:
-        self._timeline_limit = min(self._timeline_limit + 200, 2000)
+        self._timeline_limit = min(self._timeline_limit + 200, 5000)
         self._timeline_loaded_key = ""
         self.refresh()
 
@@ -3213,9 +3352,9 @@ class StatsDialog(QDialog):
             pct = (current - previous) / previous * 100
             pct_str = f"{abs(pct):.0f}%"
             if pct > 0:
-                return f"↑ {pct_str}", "#55b88d"
+                return f"↑ {pct_str}", app_color("success")
             elif pct < 0:
-                return f"↓ {pct_str}", "#d95f76"
+                return f"↓ {pct_str}", app_color("danger")
         return "—", "#738196"
 
     def _on_line_metric_changed(self) -> None:
@@ -3226,21 +3365,47 @@ class StatsDialog(QDialog):
         if not self._refreshing:
             self.refresh()
 
+    def _keep_refresh_responsive(self) -> None:
+        QApplication.processEvents()
+
+    def _show_slow_refresh_hint(self) -> None:
+        if self._refreshing:
+            self.detail_status.setText("正在加载统计数据...")
+
+    def _set_refresh_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            getattr(self, "refresh_button", None),
+            getattr(self, "prev_range_button", None),
+            getattr(self, "next_range_button", None),
+            getattr(self, "today_range_button", None),
+            getattr(self, "range_combo", None),
+            getattr(self, "start_date_edit", None),
+            getattr(self, "end_date_edit", None),
+            getattr(self, "range_picker_button", None),
+            getattr(self, "export_button", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(enabled)
+
     def refresh(self) -> None:
         if self._refreshing:
             return
         self._refreshing = True
-        if hasattr(self, "refresh_button"):
-            self.refresh_button.setEnabled(False)
+        self._slow_refresh_timer.start()
+        self._set_refresh_controls_enabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             self._do_refresh()
             self._update_data_tools_for_tab()
         finally:
+            self._slow_refresh_timer.stop()
             QApplication.restoreOverrideCursor()
-            if hasattr(self, "refresh_button"):
-                self.refresh_button.setEnabled(True)
             self._refreshing = False
+            self._set_refresh_controls_enabled(True)
+            try:
+                self.next_range_button.setEnabled(self._current_date_range()[1] < date.today())
+            except Exception:
+                pass
 
     def _do_refresh(self) -> None:
         start_date, end_date = self._current_date_range()
@@ -3253,19 +3418,21 @@ class StatsDialog(QDialog):
         active_music = active_widget is self.music_tab
         active_learning = active_widget is self.learning_analysis_tab
         active_category = active_widget is self.category_table
-        active_goal = active_widget is self.goal_table
+        active_goal = active_widget is self.goal_tab
         previous_start, previous_end = self._previous_date_range(start_date, end_date)
-        # ---- All queries (synchronous, fast with indexes) ----
-        foreground = self.storage.foreground_total_range(start_date, end_date)
-        media = self.storage.media_total_range(start_date, end_date)
-        video = self.storage.video_total_range(start_date, end_date)
-        learning_total = self.storage.learning_total_range(start_date, end_date)
-        overview_counts = self.storage.overview_counts_range(start_date, end_date)
-        prev_foreground = self.storage.foreground_total_range(previous_start, previous_end)
-        prev_media = self.storage.media_total_range(previous_start, previous_end)
-        prev_video = self.storage.video_total_range(previous_start, previous_end)
-        prev_learning = self.storage.learning_total_range(previous_start, previous_end)
+        # ---- All queries (synchronous, compact with indexes) ----
+        overview_counts = self.storage.overview_metrics_range(start_date, end_date)
+        previous_counts = self.storage.overview_metrics_range(previous_start, previous_end)
+        foreground = float(overview_counts["foreground"])
+        media = float(overview_counts["media"])
+        video = float(overview_counts["video"])
+        learning_total = float(overview_counts["learning"])
+        prev_foreground = float(previous_counts["foreground"])
+        prev_media = float(previous_counts["media"])
+        prev_video = float(previous_counts["video"])
+        prev_learning = float(previous_counts["learning"])
         learning_topics_count = int(overview_counts["learning_topic_count"])
+        self._keep_refresh_responsive()
         process_rows = list(self.storage.process_rows_range(start_date, end_date, limit=120)) if active_programs else []
         web_rows = list(self.storage.content_rows_range(start_date, end_date, kind="web_page", limit=200)) if active_web else []
         vp_rows = list(self.storage.content_rows_range(start_date, end_date, kind="video_playback", limit=200)) if active_video else []
@@ -3273,7 +3440,25 @@ class StatsDialog(QDialog):
         win_rows = list(self.storage.content_rows_range(start_date, end_date, kind="window_title", limit=200)) if active_programs else []
         cat_rows = list(self.storage.category_summary_range(start_date, end_date)) if active_overview or active_category else []
         hourly_rows = self.storage.hourly_activity_range(start_date, end_date) if active_overview else []
-        tl_rows = list(self.storage.timeline_rows_range(start_date, end_date, limit=self._timeline_limit)) if active_timeline else []
+        self._keep_refresh_responsive()
+        tl_rows = list(
+            self.storage.timeline_rows_range(
+                start_date,
+                end_date,
+                limit=self._timeline_limit,
+                query=self._timeline_search_text(),
+                kind=self._timeline_kind_value(),
+                min_seconds=self._timeline_min_seconds(),
+                sort=self._timeline_sort_value(),
+            )
+        ) if active_timeline else []
+        timeline_summary = self.storage.timeline_query_summary_range(
+            start_date,
+            end_date,
+            query=self._timeline_search_text(),
+            kind=self._timeline_kind_value(),
+            min_seconds=self._timeline_min_seconds(),
+        ) if active_timeline else {"count": 0, "seconds": 0.0}
         domain_rows = list(self.storage.domain_summary_range(start_date, end_date, limit=100)) if active_web else []
         vd_rows = list(self.storage.video_domain_summary_range(start_date, end_date, limit=100)) if active_video else []
         music_analysis = self.storage.music_analysis_range(start_date, end_date, limit=200) if active_music else []
@@ -3281,17 +3466,18 @@ class StatsDialog(QDialog):
         learning_data = self.storage.learning_topic_summary_range(start_date, end_date, limit=200) if active_learning else []
         goal_progress = self.storage.goal_progress_range(start_date, end_date) if active_goal else []
         goal_streaks = {str(g["goal"]["name"]): self.storage.goal_streak(str(g["goal"]["name"])) for g in goal_progress}
+        self._keep_refresh_responsive()
 
         # ---- Top totals ----
         self.foreground_total.setText(f"前台注视 {format_duration(foreground)}")
-        self.video_total.setText(f"视频播放 {format_duration(video)}")
+        self.video_total.setText(f"播放内容 {format_duration(video)}")
         self.media_total.setText(f"音乐播放 {format_duration(media)}")
         self.learning_total.setText(f"学习 {format_duration(learning_total)}")
         self.detail_status.setText(
             f"{start_date.isoformat()} ~ {end_date.isoformat()} · "
             f"程序 {int(overview_counts['program_count'])} · "
             f"网页 {int(overview_counts['web_count'])} · "
-            f"视频 {int(overview_counts['video_count'])} · "
+            f"播放 {int(overview_counts['video_count'])} · "
             f"分类 {int(overview_counts['category_count'])}"
         )
         span_days = max(1, (end_date - start_date).days + 1)
@@ -3306,7 +3492,7 @@ class StatsDialog(QDialog):
             f"{previous_start.isoformat()} ~ {previous_end.isoformat()}："
             f"前台 {self._compare_text(foreground, prev_foreground)} · "
             f"学习 {self._compare_text(learning_total, prev_learning)} · "
-            f"视频 {self._compare_text(video, prev_video)} · "
+            f"播放 {self._compare_text(video, prev_video)} · "
             f"音乐 {self._compare_text(media, prev_media)}"
         )
 
@@ -3315,8 +3501,8 @@ class StatsDialog(QDialog):
         web_domains = int(overview_counts["web_domain_count"])
         self.focus_card.set_data(foreground, f"{int(overview_counts['program_count'])} 个程序")
         self.web_card.set_data(web_total, f"{web_domains} 个域名")
-        self.video_card.set_data(video, f"{int(overview_counts['video_count'])} 条播放")
-        self.music_card.set_data(media, f"{int(overview_counts['music_count'])} 首/条")
+        self.video_card.set_data(video, f"{int(overview_counts['video_count'])} 条播放内容")
+        self.music_card.set_data(media, f"{int(overview_counts['music_count'])} 首歌曲/媒体")
         self.learning_today_card.set_data(learning_total, f"{learning_topics_count} 个主题")
 
         # ---- Charts ----
@@ -3361,7 +3547,7 @@ class StatsDialog(QDialog):
 
         if active_video:
             self._set_rows(self.video_table, [[
-                str(r["content_title"]), str(r["content_domain"]), str(r["category"]),
+                str(r["content_title"]), "视频播放", str(r["content_domain"]), str(r["category"]),
                 self.storage.category_explanation(str(r["category"]), str(r["exe_name"]), str(r["content_domain"]), str(r["content_title"]), str(r["learning_topic"] or "")),
                 str(r["learning_topic"] or "-"),
                 self._duration_cell(float(r["background_seconds"] or 0)), str(r["content_url"]),
@@ -3417,7 +3603,7 @@ class StatsDialog(QDialog):
                 str(r["last_seen"]),
             ] for r in music_analysis]
             self._set_rows(self.music_analysis_table, ma_rows)
-            self.music_analysis_total.set_data(media, f"{int(overview_counts['music_count'])} 首/条")
+            self.music_analysis_total.set_data(media, f"{int(overview_counts['music_count'])} 首歌曲/媒体")
             self.music_analysis_count.set_data(str(len(ma_rows)), "按歌曲+歌手去重")
             if ma_rows:
                 self.music_analysis_top.set_data(str(ma_rows[0][0])[:18], str(ma_rows[0][1])[:24])
@@ -3447,17 +3633,23 @@ class StatsDialog(QDialog):
             goal_rows = []
             goal_colors = []
             streak_parts = []
+            done_count = 0
+            close_count = 0
+            missed_count = 0
             for item in goal_progress:
                 g = item["goal"]
                 val, target = float(item["value"]), float(item["target"])
                 ok = bool(item["ok"])
                 ratio = val / target if target > 0 else 0
                 if ok:
-                    st, color = "达标", "#55b88d"
+                    st, color = "达标", app_color("success")
+                    done_count += 1
                 elif ratio >= 0.7:
-                    st, color = "接近", "#f0a33a"
+                    st, color = "接近", app_color("warning")
+                    close_count += 1
                 else:
-                    st, color = "未达标", "#d95f76"
+                    st, color = "未达标", app_color("danger")
+                    missed_count += 1
                 goal_rows.append([
                     str(g["name"]), "至少" if g["direction"] == "min" else "不超过",
                     self._duration_cell(val), self._duration_cell(target), st,
@@ -3465,8 +3657,15 @@ class StatsDialog(QDialog):
                 goal_colors.append(color)
                 streak = goal_streaks.get(str(g["name"]), 0)
                 if streak > 0:
-                    streak_parts.append(f"{g['name']} {streak}d")
+                    streak_parts.append(f"{g['name']} {streak} 天")
             self._set_rows(self.goal_table, goal_rows)
+            self.goal_done_card.set_data(str(done_count), f"{len(goal_progress)} 个启用目标")
+            self.goal_close_card.set_data(str(close_count), "70% 以上")
+            self.goal_missed_card.set_data(str(missed_count), "需要关注")
+            if hasattr(self, "goal_hint_label"):
+                self.goal_hint_label.setText(
+                    f"当前范围共有 {len(goal_progress)} 个启用目标：达标 {done_count} 个，接近 {close_count} 个，未达标 {missed_count} 个。"
+                )
             for i, c in enumerate(goal_colors):
                 item = self.goal_table.item(i, 4)
                 if item:
@@ -3480,24 +3679,43 @@ class StatsDialog(QDialog):
         # ---- Timeline: lazy-loaded because large event tables can freeze QTableWidget.
         if active_timeline:
             tl_table_rows = [[
-                str(r["start_time"]), str(r["kind"]), str(r["title"]),
+                str(r["start_time"]), self._kind_label(str(r["kind"])), str(r["title"]),
                 str(r["app_name"]), str(r["category"]),
                 str(r["learning_topic"] or "-"),
                 self._duration_cell(float(r["seconds"] or 0)),
             ] for r in tl_rows]
             self._set_rows(self.timeline_table, tl_table_rows)
             self._timeline_loaded_key = self._date_range_key()
-            more_text = "可继续加载更多" if len(tl_rows) >= self._timeline_limit else "已显示当前范围内全部可用记录"
+            total_matches = int(timeline_summary.get("count", 0))
+            total_seconds = float(timeline_summary.get("seconds", 0.0))
+            filter_parts = []
+            if self._timeline_search_text():
+                filter_parts.append(f"关键词“{self._timeline_search_text()}”")
+            if self._timeline_kind_value():
+                filter_parts.append(str(self.timeline_kind_filter.currentText()))
+            if self._timeline_min_seconds() > 0:
+                filter_parts.append(f"≥{int(self._timeline_min_seconds() / 60)}分钟")
+            filter_text = f" · {' / '.join(filter_parts)}" if filter_parts else ""
+            more_text = "可继续加载更多" if len(tl_rows) < total_matches else "已显示全部匹配记录"
             self.timeline_hint.setText(
-                f"时间线已加载最近 {len(tl_rows)} 条 · 上限 {self._timeline_limit} · {more_text}"
+                f"查询命中 {total_matches} 条 · 合计 {format_duration(total_seconds)} · "
+                f"已显示 {len(tl_rows)} 条 · 上限 {self._timeline_limit}{filter_text} · {more_text}"
             )
-            self.timeline_more_button.setEnabled(len(tl_rows) >= self._timeline_limit and self._timeline_limit < 2000)
+            self.timeline_more_button.setEnabled(len(tl_rows) < total_matches and self._timeline_limit < 5000)
+            self._update_timeline_detail()
         elif self.timeline_table.rowCount() == 0:
             self.timeline_hint.setText("时间线按需加载：切换到本页后才查询最近事件，避免详情刷新时卡住。")
 
         # ---- Deferred charts: only render while the visual tabs are relevant.
         if self.tabs.currentWidget() in {self.overview_tab, self.trend_tab}:
-            QTimer.singleShot(100, lambda: self._render_heatmap(start_date, end_date))
+            QTimer.singleShot(100, self, lambda: self._render_heatmap_if_alive(start_date, end_date))
+
+    def _render_heatmap_if_alive(self, start_date, end_date) -> None:
+        if not self.isVisible():
+            return
+        if self.tabs.currentWidget() not in {self.overview_tab, self.trend_tab}:
+            return
+        self._render_heatmap(start_date, end_date)
 
     def _render_heatmap(self, start_date, end_date) -> None:
         """Deferred: heavy heatmap + week comparison charts."""
@@ -3508,8 +3726,8 @@ class StatsDialog(QDialog):
                 lbl = str(self.line_metric_combo.currentText())
                 breakdown = self.storage.week_daily_breakdown(lm)
                 self.line_chart.set_data(breakdown["this_week"], breakdown["last_week"], lbl)
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event(f"折线图渲染失败: {type(exc).__name__}: {exc}")
         try:
             if hasattr(self, "heatmap"):
                 metric_map = {"前台注视": "foreground", "视频播放": "video", "音乐播放": "music", "学习": "learning"}
@@ -3525,8 +3743,8 @@ class StatsDialog(QDialog):
                 else:
                     hrows = [(d, lrn) for d, _, _, _, lrn in raw]
                 self.heatmap.set_data(hrows, hm_lbl)
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event(f"热力图渲染失败: {type(exc).__name__}: {exc}")
 
     def _export_with_error_message(self, path: str, action) -> None:
         try:
@@ -3595,6 +3813,11 @@ class UsageWidgetWindow(QWidget):
         self._hover_collapse_timer = QTimer(self)
         self._hover_collapse_timer.setSingleShot(True)
         self._hover_collapse_timer.timeout.connect(self._collapse_from_hover)
+        self._resize_animation = QPropertyAnimation(self, b"geometry", self)
+        self._resize_animation.setDuration(140)
+        self._resize_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._target_fixed_size: QSize | None = None
+        self._resize_animation.finished.connect(self._finish_resize_animation)
 
         self.setWindowTitle(f"UsageWidget v{__version__}")
         self.setWindowIcon(build_app_icon())
@@ -3608,10 +3831,18 @@ class UsageWidgetWindow(QWidget):
 
         self._build_ui()
         self._build_tray()
+        self._install_shortcuts()
         self.apply_settings()
         self.restore_position()
 
         self.monitor.updated.connect(self.refresh)
+
+    def _install_shortcuts(self) -> None:
+        self._shortcuts = [
+            QShortcut(QKeySequence("Ctrl+,"), self, activated=self.open_settings),
+            QShortcut(QKeySequence("Ctrl+F"), self, activated=self.open_stats_search),
+            QShortcut(QKeySequence("Ctrl+D"), self, activated=self.open_stats_today),
+        ]
 
     def _build_ui(self) -> None:
         outer_layout = QVBoxLayout(self)
@@ -3629,10 +3860,11 @@ class UsageWidgetWindow(QWidget):
         collapsed_layout = QHBoxLayout(self.collapsed_bar)
         collapsed_layout.setContentsMargins(14, 12, 14, 12)
         collapsed_layout.setSpacing(11)
-        self.status_dot = QFrame()
+        self.status_dot = QLabel("●")
         self.status_dot.setObjectName("statusDot")
         self.status_dot.setProperty("state", "active")
-        self.status_dot.setFixedSize(12, 12)
+        self.status_dot.setFixedSize(18, 18)
+        self.status_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
         status_box = QVBoxLayout()
         status_box.setContentsMargins(0, 5, 0, 0)
         status_box.setSpacing(0)
@@ -3717,13 +3949,13 @@ class UsageWidgetWindow(QWidget):
         self.top_sort_combo.setCurrentIndex(sort_index if sort_index >= 0 else 0)
         self.top_sort_combo.currentIndexChanged.connect(self.change_top_list_sort)
 
-        self.collapse_button = self._make_header_button("固", "取消固定，改为悬停展开")
+        self.collapse_button = self._make_header_button("⌖", "固定展开")
         self.collapse_button.clicked.connect(self.toggle_pin_mode)
-        self.status_button = self._make_header_button("态", "当前状态")
+        self.status_button = self._make_header_button("ℹ", "当前状态")
         self.status_button.clicked.connect(self.open_status_center)
-        self.stats_button = self._make_header_button("图", "数据详情")
+        self.stats_button = self._make_header_button("▥", "数据详情")
         self.stats_button.clicked.connect(self.open_stats)
-        self.settings_button = self._make_header_button("设", "设置")
+        self.settings_button = self._make_header_button("⚙", "设置")
         self.settings_button.clicked.connect(self.open_settings)
         header_layout.addWidget(self.collapse_button)
         header_layout.addWidget(self.status_button)
@@ -3833,7 +4065,7 @@ class UsageWidgetWindow(QWidget):
         button.setText(text)
         button.setToolTip(tooltip)
         button.setAccessibleName(tooltip)
-        button.setFixedSize(34, 30)
+        button.setFixedSize(38, 30)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         return button
 
@@ -4016,24 +4248,26 @@ class UsageWidgetWindow(QWidget):
         alpha = self.settings.background_alpha
         if dark:
             bg = f"rgba(22, 26, 32, {alpha})"
-            panel = "rgba(255, 255, 255, 22)"
-            panel_hover = "rgba(255, 255, 255, 34)"
-            border = "rgba(255, 255, 255, 48)"
+            panel = "rgba(255, 255, 255, 34)"
+            panel_hover = "rgba(255, 255, 255, 54)"
+            border = "rgba(255, 255, 255, 124)"
+            row_border = "rgba(255, 255, 255, 92)"
             text = "#f5f7fb"
-            muted = "#aeb8c7"
-            accent = "#55d6be"
-            idle = "#f0a33a"
-            paused = "#d95f76"
+            muted = "#c4cedd"
+            accent = app_color("success")
+            idle = app_color("warning")
+            paused = app_color("danger")
         else:
             bg = f"rgba(248, 250, 252, {alpha})"
             panel = "rgba(255, 255, 255, 150)"
             panel_hover = "rgba(232, 241, 252, 180)"
             border = "rgba(110, 128, 150, 72)"
+            row_border = "transparent"
             text = "#162033"
             muted = "#607089"
-            accent = "#1677d2"
+            accent = app_color("focus")
             idle = "#d98b10"
-            paused = "#d95f76"
+            paused = app_color("danger")
 
         self.setStyleSheet(
             f"""
@@ -4068,7 +4302,7 @@ class UsageWidgetWindow(QWidget):
             QLabel {{
                 color: {text};
                 letter-spacing: 0px;
-                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "Noto Sans CJK SC", "Segoe UI", "Arial";
+                font-family: {ui_font_stack()};
             }}
             QLabel#titleLabel {{
                 font-size: 18px;
@@ -4126,34 +4360,34 @@ class UsageWidgetWindow(QWidget):
                 padding: 3px 8px;
             }}
             QLabel#collapsedActivityBadge[category="学习"] {{
-                background: #27ae60;
+                background: {category_color("学习")};
             }}
             QLabel#collapsedActivityBadge[category="编程"] {{
-                background: #2c7be5;
+                background: {category_color("编程")};
             }}
             QLabel#collapsedActivityBadge[category="视频"] {{
-                background: #e67e22;
+                background: {category_color("视频")};
             }}
             QLabel#collapsedActivityBadge[category="音乐"] {{
-                background: #9b59b6;
+                background: {category_color("音乐")};
             }}
             QLabel#collapsedActivityBadge[category="游戏"] {{
-                background: #e74c3c;
+                background: {category_color("游戏")};
             }}
             QLabel#collapsedActivityBadge[category="聊天"] {{
-                background: #1abc9c;
+                background: {category_color("聊天")};
             }}
             QLabel#collapsedActivityBadge[category="AI 工具"] {{
-                background: #6c5ce7;
+                background: {category_color("AI 工具")};
             }}
             QLabel#collapsedActivityBadge[category="娱乐"] {{
-                background: #fd79a8;
+                background: {category_color("娱乐")};
             }}
             QLabel#collapsedActivityBadge[category="购物"] {{
-                background: #e17055;
+                background: {category_color("购物")};
             }}
             QLabel#collapsedActivityBadge[category="新闻"] {{
-                background: #636e72;
+                background: {category_color("新闻")};
             }}
             QLabel#collapsedMetric {{
                 color: {text};
@@ -4183,14 +4417,28 @@ class UsageWidgetWindow(QWidget):
                 background: {panel};
             }}
             QFrame#statusDot {{
-                background: {accent};
-                border-radius: 6px;
+                color: {accent};
+                background: transparent;
+                font-size: 16px;
+                font-weight: 900;
             }}
             QFrame#statusDot[state="idle"] {{
-                background: {idle};
+                color: {idle};
             }}
             QFrame#statusDot[state="paused"] {{
-                background: {paused};
+                color: {paused};
+            }}
+            QLabel#statusDot {{
+                color: {accent};
+                background: transparent;
+                font-size: 16px;
+                font-weight: 900;
+            }}
+            QLabel#statusDot[state="idle"] {{
+                color: {idle};
+            }}
+            QLabel#statusDot[state="paused"] {{
+                color: {paused};
             }}
             QToolButton {{
                 color: {text};
@@ -4231,7 +4479,7 @@ class UsageWidgetWindow(QWidget):
             }}
             QFrame#processRow {{
                 background: {panel};
-                border: 1px solid transparent;
+                border: 1px solid {row_border};
                 border-radius: 10px;
             }}
             QFrame#processRow:hover {{
@@ -4247,6 +4495,11 @@ class UsageWidgetWindow(QWidget):
             }}
             QLabel#processTime {{
                 font-size: 13px;
+                font-weight: 700;
+            }}
+            QLabel#processRatio {{
+                color: {muted};
+                font-size: 10px;
                 font-weight: 700;
             }}
             QLabel#goalStrip {{
@@ -4370,8 +4623,26 @@ class UsageWidgetWindow(QWidget):
         self.full_panel.setVisible(expanded)
         self.collapsed_bar.setVisible(not expanded)
         width, height = FULL_SIZE if expanded else COLLAPSED_SIZE
-        self.setFixedSize(width, height)
+        target_size = QSize(width, height)
+        if self.isVisible():
+            start = self.geometry()
+            target = QRect(start.topLeft(), target_size)
+            self._resize_animation.stop()
+            self.setMinimumSize(QSize(0, 0))
+            self.setMaximumSize(QSize(16777215, 16777215))
+            self._target_fixed_size = target_size
+            self._resize_animation.setStartValue(start)
+            self._resize_animation.setEndValue(target)
+            self._resize_animation.start()
+        else:
+            self.setFixedSize(target_size)
         self.keep_on_screen()
+
+    def _finish_resize_animation(self) -> None:
+        if self._target_fixed_size is not None:
+            self.setFixedSize(self._target_fixed_size)
+            self._target_fixed_size = None
+            self.keep_on_screen()
 
     def _expand_from_hover(self) -> None:
         if self._pointer_inside and not self.settings.always_expanded and self.is_collapsed:
@@ -4383,11 +4654,13 @@ class UsageWidgetWindow(QWidget):
 
     def _sync_pin_button(self) -> None:
         if self.settings.always_expanded:
-            self.collapse_button.setText("固")
+            self.collapse_button.setText("⌕")
             self.collapse_button.setToolTip("取消固定，改为悬停展开")
+            self.collapse_button.setAccessibleName("取消固定，改为悬停展开")
         else:
-            self.collapse_button.setText("浮")
+            self.collapse_button.setText("⌖")
             self.collapse_button.setToolTip("固定展开")
+            self.collapse_button.setAccessibleName("固定展开")
 
     def _sync_sort_hint(self) -> None:
         if hasattr(self, "sort_hint_label"):
@@ -4417,12 +4690,18 @@ class UsageWidgetWindow(QWidget):
     def process_icon(self, exe_path: str) -> QIcon:
         cached = self.icon_cache.get(exe_path)
         if cached:
+            self.icon_cache.pop(exe_path, None)
+            self.icon_cache[exe_path] = cached
             return cached
         path = Path(exe_path)
         if path.exists():
             icon = self.icon_provider.icon(QFileInfo(str(path)))
         else:
             icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        if len(self.icon_cache) >= MAX_ICON_CACHE_SIZE:
+            oldest_key = next(iter(self.icon_cache), None)
+            if oldest_key is not None:
+                self.icon_cache.pop(oldest_key, None)
         self.icon_cache[exe_path] = icon
         return icon
 
@@ -4441,6 +4720,11 @@ class UsageWidgetWindow(QWidget):
         widget.style().unpolish(widget)
         widget.style().polish(widget)
         widget.update()
+
+    def _sync_status_indicator(self, state: str, state_label: str) -> None:
+        symbols = {"active": "●", "idle": "◆", "paused": "Ⅱ"}
+        self.status_dot.setText(symbols.get(state, "●"))
+        self.status_dot.setAccessibleName(f"记录状态：{state_label}")
 
     def _joined_titles(self, titles: list[str], limit: int = 2) -> str:
         clean = [str(title).strip() for title in titles if str(title).strip()]
@@ -4495,6 +4779,9 @@ class UsageWidgetWindow(QWidget):
             if display_exe and display_exe.lower() != short_hint.lower():
                 return f"{short_hint} · {display_exe}"
             return short_hint
+        web_hint = low_info_web_hint(domain, title, category or "")
+        if web_hint:
+            return web_hint
         if display_exe:
             return display_exe
         return ""
@@ -4515,6 +4802,9 @@ class UsageWidgetWindow(QWidget):
         short_hint = short_activity_hint(self.monitor.current_foreground_exe or "", domain, title, category or "")
         if short_hint:
             return short_hint
+        web_hint = low_info_web_hint(domain, title, category or "")
+        if web_hint:
+            return "网页" if domain else "未识别"
         if self.monitor.current_foreground_exe:
             return "使用中"
         return ""
@@ -4607,6 +4897,7 @@ class UsageWidgetWindow(QWidget):
         else:
             total_text = metrics_text
             state = "active"
+        self._sync_status_indicator(state, state_label)
         self._set_widget_state(self.status_dot, state)
         self._set_widget_state(self.collapsed_state, state)
         if activity_short and state == "active":
@@ -4807,6 +5098,16 @@ class UsageWidgetWindow(QWidget):
         self._last_stats_refresh = time.monotonic()
         dialog.destroyed.connect(lambda: setattr(self, "stats_dialog", None))
         dialog.show()
+
+    def open_stats_search(self) -> None:
+        self.open_stats()
+        if self.stats_dialog:
+            self.stats_dialog._focus_timeline_search()
+
+    def open_stats_today(self) -> None:
+        self.open_stats()
+        if self.stats_dialog:
+            self.stats_dialog._jump_to_today_range()
 
     def open_status_center(self) -> None:
         if self.status_dialog and self.status_dialog.isVisible():

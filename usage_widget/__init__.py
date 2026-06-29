@@ -1,2 +1,2 @@
 __app_name__ = "UsageWidget"
-__version__ = "5.45.2-stable"
+__version__ = "5.45.8-stable"

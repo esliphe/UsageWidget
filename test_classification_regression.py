@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 import time
@@ -255,6 +255,101 @@ def main() -> int:
         for exe, domain, title, expected in cases:
             actual = monitor._fallback_category_for(exe, domain, title)
             check(f"{title[:24]} -> {expected}", actual == expected, f"got {actual}")
+    finally:
+        storage.close()
+        temp_dir.cleanup()
+
+    print("\n=== unidentified content repair ===")
+    storage, _monitor, _settings, temp_dir = fresh_monitor()
+    try:
+        when = datetime(2026, 1, 3, 9, 0, 0)
+        storage.increment_content_usage(
+            [
+                {
+                    "kind": "video_playback",
+                    "exe_name": "browser",
+                    "exe_path": "browser",
+                    "content_key": "video:bilibili-genshin",
+                    "content_title": "原神 4.0 新角色实况 - 哔哩哔哩",
+                    "content_url": "https://www.bilibili.com/video/BV-genshin",
+                    "content_domain": "bilibili.com",
+                    "category": "视频",
+                    "learning_topic": "",
+                    "attention_seconds": 0,
+                    "background_seconds": 1800,
+                },
+                {
+                    "kind": "web_page",
+                    "exe_name": "browser",
+                    "exe_path": "browser",
+                    "content_key": "web:dazidazi",
+                    "content_title": "在线打字练习",
+                    "content_url": "https://dazidazi.com/",
+                    "content_domain": "dazidazi.com",
+                    "category": "其他",
+                    "learning_topic": "",
+                    "attention_seconds": 300,
+                    "background_seconds": 0,
+                },
+                {
+                    "kind": "web_page",
+                    "exe_name": "browser",
+                    "exe_path": "browser",
+                    "content_key": "web:alpha-study",
+                    "content_title": "Alpha Research Dashboard",
+                    "content_url": "https://alpha-study.example/",
+                    "content_domain": "alpha-study.example",
+                    "category": "其他",
+                    "learning_topic": "",
+                    "attention_seconds": 600,
+                    "background_seconds": 0,
+                },
+            ],
+            when,
+        )
+        stats = storage.repair_unidentified_content(online=False)
+        game_row = storage.conn.execute(
+            "SELECT category FROM content_usage_daily WHERE content_key = 'video:bilibili-genshin'"
+        ).fetchone()
+        check("local repair refines bilibili video", game_row["category"] == "游戏", str(stats))
+        typing_row = storage.conn.execute(
+            "SELECT category FROM content_usage_daily WHERE content_key = 'web:dazidazi'"
+        ).fetchone()
+        check("local repair marks known typing site as tool", typing_row["category"] == "工具", str(stats))
+
+        old_lookup_sync = OnlineCategoryClassifier.lookup_sync
+
+        def fake_lookup_sync(self, exe_name: str, domain: str = "", title: str = "") -> CategoryLookupResult:
+            return CategoryLookupResult("学习", 0.82, "fake", "research learning dashboard")
+
+        OnlineCategoryClassifier.lookup_sync = fake_lookup_sync
+        try:
+            stats = storage.repair_unidentified_content(online=True, online_limit=5)
+        finally:
+            OnlineCategoryClassifier.lookup_sync = old_lookup_sync
+        online_row = storage.conn.execute(
+            "SELECT category FROM content_usage_daily WHERE content_key = 'web:alpha-study'"
+        ).fetchone()
+        check("online repair updates unknown site", online_row["category"] == "学习", str(stats))
+        explanation = storage.category_explanation("学习", "", "alpha-study.example", "Other page")
+        check("online repair persists explanation source", "来源：联网分类" in explanation, explanation)
+    finally:
+        storage.close()
+        temp_dir.cleanup()
+
+    print("\n=== timeline history query helpers ===")
+    storage, _monitor, _settings, temp_dir = fresh_monitor()
+    try:
+        day = datetime(2026, 1, 4, 10, 0, 0)
+        storage.add_timeline_event(day, day + timedelta(minutes=30), "web_page", "Python 教程 检索测试", 1800, app_name="chrome.exe", category="学习", learning_topic="Python")
+        storage.add_timeline_event(day + timedelta(hours=1), day + timedelta(hours=1, minutes=10), "video_playback", "原神 实况", 600, app_name="chrome.exe", category="游戏")
+        storage.add_timeline_event(day + timedelta(hours=2), day + timedelta(hours=2, minutes=4), "media_playback", "周杰伦 - 七里香", 240, app_name="music.exe", category="音乐")
+        rows = storage.timeline_rows_range(day.date(), day.date(), query="python", kind="web_page", min_seconds=600, sort="duration")
+        check("timeline query filters keyword/kind/min duration", len(rows) == 1 and rows[0]["category"] == "学习", [dict(row) for row in rows])
+        summary = storage.timeline_query_summary_range(day.date(), day.date(), query="python", kind="web_page", min_seconds=600)
+        check("timeline query summary", summary["count"] == 1 and int(summary["seconds"]) == 1800, str(summary))
+        duration_rows = storage.timeline_rows_range(day.date(), day.date(), sort="duration")
+        check("timeline duration sort", duration_rows[0]["seconds"] >= duration_rows[1]["seconds"], [row["seconds"] for row in duration_rows])
     finally:
         storage.close()
         temp_dir.cleanup()

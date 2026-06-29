@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -11,8 +13,18 @@ from . import __version__
 from .media import parse_music_identity
 
 
-USER_AGENT = f"UsageWidget/{__version__}"
+USER_AGENT = "UsageWidget"
 MUSICBRAINZ_USER_AGENT = f"{USER_AGENT} (local personal usage analytics)"
+API_TIMEOUTS = {
+    "itunes": 1.5,
+    "musicbrainz": 3.0,
+    "lastfm": 2.5,
+}
+API_RETRIES = {
+    "itunes": 1,
+    "musicbrainz": 2,
+    "lastfm": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -27,9 +39,15 @@ class MusicLookupResult:
 class OnlineMusicVerifier:
     MAX_CACHE_SIZE = 800
 
-    def __init__(self, min_interval: float = 8.0, ttl_seconds: float = 86400.0) -> None:
+    def __init__(
+        self,
+        min_interval: float = 8.0,
+        ttl_seconds: float = 86400.0,
+        lastfm_api_key: str | None = None,
+    ) -> None:
         self.min_interval = min_interval
         self.ttl_seconds = ttl_seconds
+        self.lastfm_api_key = (lastfm_api_key or os.getenv("USAGEWIDGET_LASTFM_API_KEY", "")).strip()
         self.error_ttl_seconds = 600.0
         self.max_workers = 5
         self._lock = threading.Lock()
@@ -121,7 +139,12 @@ class OnlineMusicVerifier:
 
     def _lookup_itunes(self, query: str, song: str, artist: str) -> MusicLookupResult:
         params = urllib.parse.urlencode({"term": query, "media": "music", "entity": "song", "limit": 5})
-        data = self._fetch_json(f"https://itunes.apple.com/search?{params}", headers={"User-Agent": USER_AGENT})
+        data = self._fetch_json(
+            f"https://itunes.apple.com/search?{params}",
+            headers={"User-Agent": USER_AGENT},
+            timeout=API_TIMEOUTS["itunes"],
+            retries=API_RETRIES["itunes"],
+        )
         for item in data.get("results", []):
             track = str(item.get("trackName", "")).strip()
             artist_name = str(item.get("artistName", "")).strip()
@@ -134,6 +157,8 @@ class OnlineMusicVerifier:
         data = self._fetch_json(
             f"https://musicbrainz.org/ws/2/recording/?{params}",
             headers={"User-Agent": MUSICBRAINZ_USER_AGENT},
+            timeout=API_TIMEOUTS["musicbrainz"],
+            retries=API_RETRIES["musicbrainz"],
         )
         for item in data.get("recordings", []):
             track = str(item.get("title", "")).strip()
@@ -148,10 +173,12 @@ class OnlineMusicVerifier:
 
     def _lookup_lastfm(self, query: str, song: str, artist: str) -> MusicLookupResult:
         """Query Last.fm search API as a fallback music verification source."""
+        if not self.lastfm_api_key:
+            return MusicLookupResult(False, 0.0, "lastfm-disabled")
         params = urllib.parse.urlencode({
             "method": "track.search",
             "track": query,
-            "api_key": "2c5389f92935c2ef25f6e1f8b944a3d3",
+            "api_key": self.lastfm_api_key,
             "format": "json",
             "limit": "5",
         })
@@ -159,6 +186,8 @@ class OnlineMusicVerifier:
             data = self._fetch_json(
                 f"https://ws.audioscrobbler.com/2.0/?{params}",
                 headers={"User-Agent": USER_AGENT},
+                timeout=API_TIMEOUTS["lastfm"],
+                retries=API_RETRIES["lastfm"],
             )
             tracks = data.get("results", {}).get("trackmatches", {}).get("track", [])
             if not isinstance(tracks, list):
@@ -172,11 +201,28 @@ class OnlineMusicVerifier:
             pass
         return MusicLookupResult(False, 0.0, "lastfm")
 
-    def _fetch_json(self, url: str, headers: dict[str, str]) -> dict:
-        request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=3.0) as response:
-            raw = response.read(256 * 1024)
-        return json.loads(raw.decode("utf-8", errors="replace"))
+    def _fetch_json(self, url: str, headers: dict[str, str], *, timeout: float = 3.0, retries: int = 0) -> dict:
+        last_error: Exception | None = None
+        for attempt in range(max(0, retries) + 1):
+            request = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    raw = response.read(256 * 1024)
+                data = json.loads(raw.decode("utf-8", errors="replace"))
+                if not isinstance(data, dict):
+                    raise ValueError(f"Expected JSON object, got {type(data).__name__}")
+                return data
+            except urllib.error.HTTPError as exc:
+                if 400 <= exc.code < 500 and exc.code != 429:
+                    raise
+                last_error = exc
+            except (OSError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+                last_error = exc
+            if attempt < retries:
+                time.sleep(min(0.8, 0.2 * (2 ** attempt)))
+        if last_error:
+            raise last_error
+        raise RuntimeError("music lookup request failed")
 
     def _matches(self, song: str, artist: str, track: str, artist_name: str) -> bool:
         song_l = self._norm(song)

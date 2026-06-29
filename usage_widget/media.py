@@ -138,6 +138,54 @@ class MediaSessionProvider:
         with self._lock:
             return list(self._items)
 
+    def refresh_sync(self, timeout_seconds: float = 0.8) -> list[MediaItem]:
+        now = time.monotonic()
+        with self._lock:
+            if not self.available and now - self._last_refresh < 60.0:
+                return list(self._items)
+            if self._refreshing or now - self._last_refresh < self.min_interval:
+                return list(self._items)
+            self._refreshing = True
+            self._last_refresh = now
+        try:
+            items_box: list[list[MediaItem]] = []
+            error_box: list[BaseException] = []
+
+            def worker() -> None:
+                try:
+                    items_box.append(asyncio.run(_read_media_sessions()))
+                except BaseException as exc:  # noqa: BLE001
+                    error_box.append(exc)
+
+            thread = threading.Thread(target=worker, name="UsageWidgetMediaRefreshSync", daemon=True)
+            thread.start()
+            thread.join(max(0.1, timeout_seconds))
+            if thread.is_alive():
+                with self._lock:
+                    self._refreshing = False
+                    self.last_error = "Media refresh timed out"
+                self.refresh_async()
+                return self.current_items()
+            if error_box:
+                raise error_box[0]
+            items = items_box[0] if items_box else []
+            with self._lock:
+                self._items = items
+                self.available = True
+                self.consecutive_errors = 0
+                self.last_error = ""
+                self.last_success_at = time.monotonic()
+                self._refreshing = False
+                return list(self._items)
+        except Exception as exc:
+            with self._lock:
+                self.consecutive_errors += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                self.available = self.consecutive_errors < 5
+                self._items = []
+                self._refreshing = False
+            return []
+
     def refresh_async(self) -> None:
         now = time.monotonic()
         with self._lock:

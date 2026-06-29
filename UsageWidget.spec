@@ -1,11 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+
+font_datas = []
+for font_dir in (Path("fonts"), Path("assets") / "fonts"):
+    if font_dir.exists():
+        for pattern in ("*.ttf", "*.otf", "*.ttc"):
+            font_datas.extend((str(path), str(font_dir)) for path in font_dir.glob(pattern))
+
+if not font_datas:
+    raise SystemExit("No bundled UI fonts found. Put a CJK-capable .ttf/.otf/.ttc file in fonts/ before building.")
 
 
 a = Analysis(
     ['run.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=font_datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

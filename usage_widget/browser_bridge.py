@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -8,6 +9,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from .classification import clean_lookup_title
+
+
+AUTH_HEADER = "X-UsageWidget-Token"
+ALLOWED_EXTENSION_ORIGIN_PREFIXES = ("chrome-extension://", "moz-extension://")
 
 
 @dataclass(frozen=True)
@@ -58,12 +63,14 @@ class BrowserBridge:
     def __init__(self, host: str = "127.0.0.1", port: int = 47621) -> None:
         self.host = host
         self.port = port
+        self.auth_token = secrets.token_urlsafe(32)
         self._lock = threading.RLock()
         self._latest: BrowserTab | None = None
         self._audible_tabs: list[BrowserTab] = []
         self._page_signals: dict[str, PageSignal] = {}
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self.last_error = ""
 
     def start(self) -> None:
         if self._server:
@@ -73,11 +80,27 @@ class BrowserBridge:
 
         class Handler(BaseHTTPRequestHandler):
             def do_OPTIONS(self) -> None:  # noqa: N802
+                if not self._request_allowed(check_token=False):
+                    self._send_cors(403, b'{"ok":false,"error":"forbidden"}')
+                    return
                 self._send_cors(204)
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path != "/session":
+                    self._send_cors(404, b'{"ok":false,"error":"not_found"}')
+                    return
+                if not self._request_allowed(check_token=False):
+                    self._send_cors(403, b'{"ok":false,"error":"forbidden"}')
+                    return
+                body = json.dumps({"token": bridge.auth_token}).encode("utf-8")
+                self._send_cors(200, body)
 
             def do_POST(self) -> None:  # noqa: N802
                 if self.path not in {"/active-tab", "/audible-tabs", "/page-signal"}:
                     self._send_cors(404)
+                    return
+                if not self._request_allowed(check_token=True):
+                    self._send_cors(401, b'{"ok":false,"error":"unauthorized"}')
                     return
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
@@ -103,11 +126,24 @@ class BrowserBridge:
             def log_message(self, _format: str, *_args: object) -> None:
                 return
 
+            def _request_allowed(self, check_token: bool) -> bool:
+                if not bridge._host_allowed(self.headers.get("Host", "")):
+                    return False
+                if not bridge._origin_allowed(self.headers.get("Origin", "")):
+                    return False
+                if check_token and self.headers.get(AUTH_HEADER, "") != bridge.auth_token:
+                    return False
+                return True
+
             def _send_cors(self, status: int, body: bytes = b"") -> None:
                 self.send_response(status)
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type")
-                self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+                cors_origin = bridge._cors_origin(self.headers.get("Origin", ""))
+                if cors_origin:
+                    self.send_header("Access-Control-Allow-Origin", cors_origin)
+                    self.send_header("Vary", "Origin")
+                self.send_header("Access-Control-Allow-Headers", f"Content-Type, {AUTH_HEADER}")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 if body:
@@ -115,6 +151,7 @@ class BrowserBridge:
 
         try:
             self._server = ThreadingHTTPServer((self.host, self.port), Handler)
+            self.port = int(self._server.server_address[1])
         except OSError as exc:
             self._server = None
             self.last_error = f"Port {self.port} unavailable: {exc}"
@@ -128,6 +165,23 @@ class BrowserBridge:
         if server:
             server.shutdown()
             server.server_close()
+
+    def rotate_auth_token(self) -> str:
+        self.auth_token = secrets.token_urlsafe(32)
+        return self.auth_token
+
+    def _host_allowed(self, host_header: str) -> bool:
+        host = (host_header or "").split(":", 1)[0].strip("[]").casefold()
+        return host in {"127.0.0.1", "localhost", "::1"}
+
+    def _origin_allowed(self, origin: str) -> bool:
+        origin_l = (origin or "").casefold()
+        return origin_l.startswith(ALLOWED_EXTENSION_ORIGIN_PREFIXES)
+
+    def _cors_origin(self, origin: str) -> str:
+        if self._origin_allowed(origin):
+            return origin or "*"
+        return ""
 
     def _signal_for_url(self, url: str, max_age_seconds: float = 30.0) -> PageSignal | None:
         with self._lock:

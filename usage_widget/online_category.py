@@ -9,7 +9,6 @@ import urllib.request
 import html as html_lib
 from dataclasses import dataclass
 
-from . import __version__
 from .classification import (
     BROAD_PLATFORM_CATEGORIES,
     clean_lookup_title,
@@ -18,7 +17,7 @@ from .classification import (
 )
 
 
-USER_AGENT = f"UsageWidget/{__version__}"
+USER_AGENT = "UsageWidget"
 DESKTOP_USER_AGENT = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) {USER_AGENT}"
 
 @dataclass(frozen=True)
@@ -447,6 +446,15 @@ class OnlineCategoryClassifier:
             "system",
             "download",
             "compress",
+            "typing",
+            "typing practice",
+            "type practice",
+            "keyboard practice",
+            "words per minute",
+            "wpm",
+            "打字",
+            "打字练习",
+            "键盘练习",
             "工具",
             "下载",
             "压缩",
@@ -464,6 +472,7 @@ class OnlineCategoryClassifier:
         self.ttl_seconds = ttl_seconds
         self.error_ttl_seconds = 900.0  # Only cache errors for 15 minutes
         self.max_workers = 6
+        self.max_pending = 80
         self._lock = threading.Lock()
         self._cache: dict[str, tuple[float, CategoryLookupResult]] = {}
         self._pending: set[str] = set()
@@ -472,6 +481,7 @@ class OnlineCategoryClassifier:
         self.last_error = ""
         self.last_source = ""
         self.last_query = ""
+        self.last_provider_errors = ""
 
     def cached(self, exe_name: str, domain: str = "", title: str = "") -> CategoryLookupResult | None:
         key = self._key(exe_name, domain, title)
@@ -494,6 +504,9 @@ class OnlineCategoryClassifier:
         with self._lock:
             if key in self._pending or key in self._cache:
                 return
+            if len(self._pending) >= self.max_pending:
+                self.last_error = "Online category queue full"
+                return
             if self._active_workers >= self.max_workers:
                 return  # Drop request if too many workers are already running
             self._pending.add(key)
@@ -512,6 +525,22 @@ class OnlineCategoryClassifier:
                 self._active_workers -= 1
                 self.last_error = f"Thread start failed: {exc}"
 
+    def lookup_sync(self, exe_name: str, domain: str = "", title: str = "") -> CategoryLookupResult:
+        key = self._key(exe_name, domain, title)
+        if not key:
+            return CategoryLookupResult("其他", 0.0, "empty")
+        cached = self.cached(exe_name, domain, title)
+        if cached is not None:
+            return cached
+        result = self._lookup(exe_name, domain, title)
+        with self._lock:
+            self._cache[key] = (time.monotonic(), result)
+            self._evict_locked()
+            if result.category != "其他" or result.source not in {"multi", "error"}:
+                self.last_error = ""
+            self.last_source = result.source
+        return result
+
     def _worker(self, key: str, exe_name: str, domain: str, title: str) -> None:
         try:
             with self._lock:
@@ -524,7 +553,8 @@ class OnlineCategoryClassifier:
             with self._lock:
                 self._cache[key] = (time.monotonic(), result)
                 self._evict_locked()
-                self.last_error = ""
+                if result.category != "其他" or result.source not in {"multi", "error"}:
+                    self.last_error = ""
                 self.last_source = result.source
         except Exception as exc:
             with self._lock:
@@ -557,8 +587,9 @@ class OnlineCategoryClassifier:
             return CategoryLookupResult(category, confidence, "local-query", query[:260])
 
         providers = []
-        if re.search(r"[\u4e00-\u9fff]", query):
-            providers.append(lambda: self._lookup_baidu(query, domain))
+        if domain and not self._is_generic_content_domain(domain):
+            providers.append(lambda: self._lookup_site_metadata(query, domain))
+        providers.append(lambda: self._lookup_baidu(query, domain))
         providers.extend(
             [
                 lambda: self._lookup_duckduckgo(query, domain),
@@ -567,15 +598,15 @@ class OnlineCategoryClassifier:
                 lambda: self._lookup_wikipedia(query, domain, "en"),
             ]
         )
-        if not re.search(r"[\u4e00-\u9fff]", query):
-            providers.append(lambda: self._lookup_baidu(query, domain))
 
         best = CategoryLookupResult("其他", 0.0, "multi")
+        provider_errors = []
         for provider in providers:
             try:
                 result = provider()
             except Exception as exc:
-                self.last_error = f"{type(exc).__name__}: {exc}"
+                provider_errors.append(f"{type(exc).__name__}: {exc}")
+                self.last_error = provider_errors[-1]
                 continue
             candidate = result if result.category != "其他" else None
             if result.source in {"duckduckgo", "duckduckgo-html", "baidu"} and result.summary:
@@ -585,10 +616,15 @@ class OnlineCategoryClassifier:
             if candidate and candidate.confidence > best.confidence:
                 best = candidate
             if candidate and candidate.confidence >= 0.70:
+                self.last_provider_errors = " | ".join(provider_errors[-3:])
                 return candidate
 
         if best.category != "其他" and best.confidence >= 0.55:
+            self.last_provider_errors = " | ".join(provider_errors[-3:])
             return best
+        self.last_provider_errors = " | ".join(provider_errors[-3:])
+        if provider_errors:
+            self.last_error = self.last_provider_errors
         return CategoryLookupResult("其他", 0.0, "multi")
 
     def _is_generic_content_domain(self, domain: str) -> bool:
@@ -596,6 +632,49 @@ class OnlineCategoryClassifier:
 
     def _is_broad_platform_bucket(self, domain: str, category: str) -> bool:
         return self._is_generic_content_domain(domain) and category in BROAD_PLATFORM_CATEGORIES
+
+    def _lookup_site_metadata(self, query: str, domain: str) -> CategoryLookupResult:
+        """Fetch a site's own title/meta first; this is faster and stabler than a search page for unknown domains."""
+        domain = domain.strip().strip("/")
+        if not domain or len(domain) > 180:
+            return CategoryLookupResult("其他", 0.0, "site-meta")
+        if not re.match(r"^[a-z0-9.-]+(?::\d+)?$", domain, re.I):
+            return CategoryLookupResult("其他", 0.0, "site-meta")
+        pieces = []
+        for scheme in ("https", "http"):
+            try:
+                text = self._fetch_text(f"{scheme}://{domain}/")
+            except Exception:
+                continue
+            pieces = self._site_metadata_pieces(text)
+            if pieces:
+                break
+        summary = html_lib.unescape(re.sub(r"<[^>]+>", " ", " ".join(pieces)))
+        summary = re.sub(r"\s+", " ", summary).strip()
+        if not summary:
+            return CategoryLookupResult("其他", 0.0, "site-meta")
+        category, confidence = self._classify_text(" ".join((query, domain, summary)))
+        if category == "其他":
+            category, confidence = self._classify_text(" ".join((domain, summary)))
+        return CategoryLookupResult(category, confidence, "site-meta", summary[:260])
+
+    def _site_metadata_pieces(self, text: str) -> list[str]:
+        pieces = []
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+        if title_match:
+            pieces.append(title_match.group(1))
+        for meta_match in re.finditer(r"<meta\b[^>]*>", text, re.I | re.S):
+            tag = meta_match.group(0)
+            name_match = re.search(r'(?:name|property)=["\']([^"\']+)["\']', tag, re.I)
+            content_match = re.search(r'content=["\']([^"\']+)["\']', tag, re.I | re.S)
+            if not name_match or not content_match:
+                continue
+            name = name_match.group(1).casefold()
+            if name in {"description", "keywords", "og:title", "og:description", "twitter:title", "twitter:description"}:
+                pieces.append(content_match.group(1))
+            if len(pieces) >= 8:
+                break
+        return pieces
 
     def _lookup_baidu(self, query: str, domain: str) -> CategoryLookupResult:
         params = urllib.parse.urlencode({"wd": query})
@@ -712,7 +791,7 @@ class OnlineCategoryClassifier:
             score = 0
             for hint in hints:
                 hint_l = hint.casefold()
-                if hint_l in text_l:
+                if self._hint_matches(text_l, hint_l):
                     score += 2 + min(4, len(hint_l) // 5)
             if score:
                 scores[category] = score
@@ -723,9 +802,19 @@ class OnlineCategoryClassifier:
         confidence = min(0.92, 0.48 + score * 0.06 + max(0, score - second) * 0.03)
         return category, confidence
 
+    @staticmethod
+    def _hint_matches(text_l: str, hint_l: str) -> bool:
+        if not hint_l:
+            return False
+        # Short latin hints like "ai", "exam", "wpm" should not match inside
+        # unrelated words/domains such as "train", "example.com", or "dazidazi".
+        if re.fullmatch(r"[a-z0-9]+", hint_l) and len(hint_l) <= 4:
+            return re.search(rf"(?<![a-z0-9]){re.escape(hint_l)}(?![a-z0-9])", text_l) is not None
+        return hint_l in text_l
+
     def _fetch_json(self, url: str) -> dict:
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(request, timeout=3.0) as response:
+        with urllib.request.urlopen(request, timeout=2.5) as response:
             raw = response.read(256 * 1024)
         data = json.loads(raw.decode("utf-8", errors="replace"))
         if not isinstance(data, dict):
@@ -740,12 +829,21 @@ class OnlineCategoryClassifier:
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
             },
         )
-        with urllib.request.urlopen(request, timeout=4.0) as response:
+        with urllib.request.urlopen(request, timeout=2.5) as response:
             raw = response.read(256 * 1024)
+            charset = response.headers.get_content_charset() or ""
+        for encoding in (charset, "utf-8", "gb18030"):
+            if not encoding:
+                continue
+            try:
+                return raw.decode(encoding, errors="replace")
+            except LookupError:
+                continue
         return raw.decode("utf-8", errors="replace")
 
     def _key(self, exe_name: str, domain: str, title: str) -> str:
-        base = f"{exe_name.casefold().strip()}|{domain.casefold().strip()}|{title.casefold().strip()}"
+        clean_title = clean_lookup_title(domain, title)
+        base = f"{exe_name.casefold().strip()}|{domain.casefold().strip()}|{clean_title.casefold().strip()}"
         return base[:300]
 
     def _evict_locked(self) -> None:

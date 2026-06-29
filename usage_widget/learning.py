@@ -9,11 +9,10 @@ import urllib.request
 import html as html_lib
 from dataclasses import dataclass
 
-from . import __version__
 from .classification import clean_lookup_title
 
 
-USER_AGENT = f"UsageWidget/{__version__}"
+USER_AGENT = "UsageWidget"
 DESKTOP_USER_AGENT = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) {USER_AGENT}"
 
 LEARNING_INTENT_HINTS = {

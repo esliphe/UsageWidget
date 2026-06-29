@@ -5,6 +5,7 @@ import html
 import os
 import shutil
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -745,6 +746,7 @@ class Storage:
                 "source": "TEXT NOT NULL DEFAULT 'user'",
             },
         )
+        self._migrate_category_rules_key()
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_content_usage_daily_domain ON content_usage_daily (content_domain)"
         )
@@ -753,6 +755,12 @@ class Storage:
         )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_content_usage_daily_learning_topic ON content_usage_daily (learning_topic)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_low_confidence_repair ON content_usage_daily (category, learning_topic, last_seen DESC)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_kind_category_topic ON content_usage_daily (kind, category, learning_topic)"
         )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_timeline_events_date ON timeline_events (event_date)"
@@ -765,6 +773,18 @@ class Storage:
         )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_timeline_events_date_kind ON timeline_events (event_date, kind)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timeline_events_date_kind_seconds ON timeline_events (event_date, kind, seconds DESC)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timeline_events_date_seconds_start ON timeline_events (event_date, seconds DESC, start_time DESC)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timeline_events_date_hour_kind ON timeline_events (event_date, substr(start_time, 12, 2), kind)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timeline_events_date_category_topic ON timeline_events (event_date, category, learning_topic)"
         )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_content_kind_domain ON content_usage_daily (kind, content_domain)"
@@ -820,6 +840,39 @@ class Storage:
         except sqlite3.OperationalError as exc:
             log_event(f"浏览器媒体旧数据迁移跳过：{exc}")
         self.conn.commit()
+
+    def _migrate_category_rules_key(self) -> None:
+        info = self.conn.execute("PRAGMA table_info(category_rules)").fetchall()
+        has_id = any(str(row["name"]) == "id" for row in info)
+        if has_id:
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_category_rules_pattern_target ON category_rules (pattern, target)"
+            )
+            return
+        self.conn.execute("DROP TABLE IF EXISTS category_rules_old_single_key")
+        self.conn.execute("ALTER TABLE category_rules RENAME TO category_rules_old_single_key")
+        self.conn.execute(
+            """
+            CREATE TABLE category_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern TEXT NOT NULL,
+                category TEXT NOT NULL,
+                target TEXT NOT NULL DEFAULT 'any',
+                source TEXT NOT NULL DEFAULT 'user',
+                UNIQUE(pattern, target)
+            );
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO category_rules (pattern, category, target, source)
+            SELECT pattern, category, target, COALESCE(NULLIF(source, ''), 'user')
+            FROM category_rules_old_single_key
+            WHERE TRIM(pattern) != ''
+            """
+        )
+        self.conn.execute("DROP TABLE category_rules_old_single_key")
+        self._category_rules_cache = None
 
     def _ensure_columns(self, table: str, columns: dict[str, str]) -> None:
         existing = {
@@ -1160,7 +1213,20 @@ class Storage:
     def category_rules(self) -> list[sqlite3.Row]:
         if self._category_rules_cache is None:
             self._category_rules_cache = self.conn.execute(
-                "SELECT pattern, category, target, source FROM category_rules ORDER BY category, pattern"
+                """
+                SELECT pattern, category, target, source
+                FROM category_rules
+                ORDER BY
+                    CASE COALESCE(source, 'user')
+                        WHEN 'user' THEN 0
+                        WHEN 'default' THEN 1
+                        WHEN 'online' THEN 2
+                        ELSE 3
+                    END,
+                    category,
+                    pattern,
+                    target
+                """
             ).fetchall()
         return self._category_rules_cache
 
@@ -1223,48 +1289,105 @@ class Storage:
                 """
                 INSERT INTO category_rules (pattern, category, target, source)
                 VALUES (?, ?, ?, ?)
-                ON CONFLICT(pattern) DO UPDATE SET
+                ON CONFLICT(pattern, target) DO UPDATE SET
                     category = excluded.category,
-                    target = excluded.target,
                     source = excluded.source
                 """,
                 (pattern, category, target, source),
             )
         if update_existing:
-            like = f"%{pattern}%"
-            if target == "domain":
-                self.conn.execute(
-                    "UPDATE content_usage_daily SET category = ? WHERE lower(content_domain) LIKE ?",
-                    (category, like),
-                )
-            elif target == "title":
-                self.conn.execute(
-                    "UPDATE content_usage_daily SET category = ? WHERE lower(content_title) LIKE ?",
-                    (category, like),
-                )
-            elif target == "app":
-                self.conn.execute(
-                    """
-                    UPDATE content_usage_daily
-                    SET category = ?
-                    WHERE lower(exe_name) LIKE ? OR lower(exe_path) LIKE ?
-                    """,
-                    (category, like, like),
-                )
-            else:
-                self.conn.execute(
-                    """
-                    UPDATE content_usage_daily
-                    SET category = ?
-                    WHERE lower(content_domain) LIKE ?
-                       OR lower(content_title) LIKE ?
-                       OR lower(exe_name) LIKE ?
-                       OR lower(exe_path) LIKE ?
-                    """,
-                    (category, like, like, like, like),
-                )
+            self._apply_category_correction_to_existing(pattern, category, target)
         self._category_rules_cache = None
         self.conn.commit()
+
+    def _learning_topic_after_category_correction(self, category: str) -> str:
+        return "learning_topic" if category == "学习" else "''"
+
+    def _apply_category_correction_to_existing(self, pattern: str, category: str, target: str) -> None:
+        like = f"%{pattern}%"
+        topic_sql = self._learning_topic_after_category_correction(category)
+        if target == "domain":
+            self.conn.execute(
+                f"""
+                UPDATE content_usage_daily
+                SET category = ?,
+                    learning_topic = {topic_sql}
+                WHERE lower(content_domain) LIKE ?
+                """,
+                (category, like),
+            )
+            self.conn.execute(
+                f"""
+                UPDATE timeline_events
+                SET category = ?,
+                    learning_topic = {topic_sql}
+                WHERE lower(extra) LIKE ?
+                """,
+                (category, like),
+            )
+        elif target == "title":
+            self.conn.execute(
+                f"""
+                UPDATE content_usage_daily
+                SET category = ?,
+                    learning_topic = {topic_sql}
+                WHERE lower(content_title) LIKE ?
+                """,
+                (category, like),
+            )
+            self.conn.execute(
+                f"""
+                UPDATE timeline_events
+                SET category = ?,
+                    learning_topic = {topic_sql}
+                WHERE lower(title) LIKE ?
+                """,
+                (category, like),
+            )
+        elif target == "app":
+            self.conn.execute(
+                f"""
+                UPDATE content_usage_daily
+                SET category = ?,
+                    learning_topic = {topic_sql}
+                WHERE lower(exe_name) LIKE ? OR lower(exe_path) LIKE ?
+                """,
+                (category, like, like),
+            )
+            self.conn.execute(
+                f"""
+                UPDATE timeline_events
+                SET category = ?,
+                    learning_topic = {topic_sql}
+                WHERE lower(app_name) LIKE ? OR lower(app_path) LIKE ?
+                """,
+                (category, like, like),
+            )
+        else:
+            self.conn.execute(
+                f"""
+                UPDATE content_usage_daily
+                SET category = ?,
+                    learning_topic = {topic_sql}
+                WHERE lower(content_domain) LIKE ?
+                   OR lower(content_title) LIKE ?
+                   OR lower(exe_name) LIKE ?
+                   OR lower(exe_path) LIKE ?
+                """,
+                (category, like, like, like, like),
+            )
+            self.conn.execute(
+                f"""
+                UPDATE timeline_events
+                SET category = ?,
+                    learning_topic = {topic_sql}
+                WHERE lower(title) LIKE ?
+                   OR lower(app_name) LIKE ?
+                   OR lower(app_path) LIKE ?
+                   OR lower(extra) LIKE ?
+                """,
+                (category, like, like, like, like),
+            )
 
     def _category_rule_match(
         self,
@@ -1277,6 +1400,7 @@ class Storage:
         title_l = (title or "").lower()
         combined = f"{exe} {domain_l} {title_l}"
         best: tuple[int, int, str, str, str, str] | None = None
+        source_priority = {"user": 3000, "default": 2000, "online": 1000}
         for row in self.category_rules():
             pattern = str(row["pattern"]).lower()
             target = str(row["target"])
@@ -1291,6 +1415,8 @@ class Storage:
                 score = max(score, 250 + len(pattern))
             if target == "any" and score == 0 and pattern in combined:
                 score = 100 + len(pattern)
+            if score > 0:
+                score += source_priority.get(source, 2500)
             if score > 0 and (best is None or score > best[0]):
                 best = (score, len(pattern), category, target, pattern, source)
         return best
@@ -1370,6 +1496,202 @@ class Storage:
             "broad_video_rows": broad_video,
             "low_confidence_rows": low_conf,
         }
+
+    @staticmethod
+    def _is_low_confidence_category(category: str, learning_topic: str = "") -> bool:
+        return not learning_topic and category in {"其他", "视频", "网站", "浏览器", "工具"}
+
+    def low_confidence_content_rows(self, limit: int = 500) -> list[sqlite3.Row]:
+        limit = max(1, min(5000, int(limit)))
+        return self.conn.execute(
+            """
+            SELECT usage_date, kind, exe_name, exe_path, content_key, content_title,
+                   content_url, content_domain, category, learning_topic,
+                   attention_seconds, background_seconds, last_seen
+            FROM content_usage_daily
+            WHERE category IN ('其他', '视频', '网站', '浏览器', '工具')
+              AND learning_topic = ''
+            ORDER BY (attention_seconds + background_seconds) DESC, last_seen DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    def repair_unidentified_content(
+        self,
+        *,
+        online: bool = False,
+        limit: int = 500,
+        online_limit: int = 180,
+        online_time_budget_seconds: float = 55.0,
+    ) -> dict[str, int]:
+        """Backfill low-confidence content categories using local rules first, then optional online lookup."""
+        from .classification import (
+            BROAD_PLATFORM_CATEGORIES,
+            clean_lookup_title,
+            is_generic_content_domain,
+            normalize_lookup_text,
+        )
+
+        rows = self.low_confidence_content_rows(limit)
+        stats = {
+            "checked": len(rows),
+            "local_updated": 0,
+            "online_enabled": 1 if online else 0,
+            "online_candidates": 0,
+            "online_checked": 0,
+            "online_updated": 0,
+            "online_skipped": 0,
+            "online_disabled": 0,
+            "online_limit_skipped": 0,
+            "online_duplicate_skipped": 0,
+            "online_no_query": 0,
+            "remaining": 0,
+        }
+        updates: list[tuple[str, str, str, str, str]] = []
+        online_candidates = []
+        seen_online_keys: set[str] = set()
+        online_cap = max(0, int(online_limit))
+        for row in rows:
+            current = str(row["category"] or "其他")
+            topic = str(row["learning_topic"] or "")
+            exe_name = str(row["exe_name"] or "")
+            domain = str(row["content_domain"] or "")
+            title = clean_lookup_title(domain, str(row["content_title"] or ""))
+            local_match = self._category_rule_match(exe_name, domain, title)
+            local = local_match[2] if local_match else "其他"
+            strong_local_tool = bool(
+                local_match
+                and local == "工具"
+                and local_match[0] >= 300
+                and local_match[5] in {"default", "user", "online"}
+            )
+            if local and local != current and (not self._is_low_confidence_category(local, topic) or strong_local_tool):
+                updates.append((local, str(row["usage_date"]), str(row["kind"]), str(row["exe_path"]), str(row["content_key"])))
+                stats["local_updated"] += 1
+                continue
+            if not online:
+                stats["online_disabled"] += 1
+                continue
+            query_key = normalize_lookup_text(exe_name, domain, title).casefold()[:220]
+            if len(query_key) < 4:
+                stats["online_no_query"] += 1
+                continue
+            if query_key in seen_online_keys:
+                stats["online_duplicate_skipped"] += 1
+                continue
+            if len(online_candidates) >= online_cap:
+                stats["online_limit_skipped"] += 1
+                continue
+            seen_online_keys.add(query_key)
+            online_candidates.append(row)
+            stats["online_candidates"] += 1
+
+        if updates:
+            self.conn.executemany(
+                """
+                UPDATE content_usage_daily
+                SET category = ?
+                WHERE usage_date = ? AND kind = ? AND exe_path = ? AND content_key = ?
+                """,
+                updates,
+            )
+            self.conn.commit()
+
+        if online and online_candidates:
+            from .online_category import OnlineCategoryClassifier
+
+            classifier = OnlineCategoryClassifier(min_interval=0.0)
+            online_updates: list[tuple[str, str, str, str, str]] = []
+            learned_rules: list[tuple[str, str, str, str]] = []
+            online_cache = {}
+            online_started_at = time.monotonic()
+            online_budget = max(5.0, float(online_time_budget_seconds))
+            for row in online_candidates:
+                if time.monotonic() - online_started_at >= online_budget:
+                    stats["online_skipped"] += len(online_candidates) - stats["online_checked"]
+                    break
+                exe_name = str(row["exe_name"] or "")
+                domain = str(row["content_domain"] or "")
+                title = clean_lookup_title(domain, str(row["content_title"] or ""))
+                cache_key = classifier._key(exe_name, domain, title)
+                if not cache_key:
+                    continue
+                stats["online_checked"] += 1
+                try:
+                    result = online_cache.get(cache_key)
+                    if result is None:
+                        result = classifier.lookup_sync(exe_name, domain, title)
+                        online_cache[cache_key] = result
+                except Exception as exc:
+                    log_event(f"历史内容联网分类失败: domain={domain} title={title[:80]} error={exc}")
+                    continue
+                if (
+                    result.category
+                    and result.category != "其他"
+                    and result.confidence >= 0.58
+                    and (
+                        not self._is_low_confidence_category(result.category, str(row["learning_topic"] or ""))
+                        or (
+                            result.category == "工具"
+                            and result.confidence >= 0.70
+                            and domain
+                            and not is_generic_content_domain(domain)
+                        )
+                    )
+                ):
+                    online_updates.append(
+                        (
+                            result.category,
+                            str(row["usage_date"]),
+                            str(row["kind"]),
+                            str(row["exe_path"]),
+                            str(row["content_key"]),
+                        )
+                    )
+                    stats["online_updated"] += 1
+                    domain_l = domain.casefold().strip()
+                    exe_l = exe_name.casefold().strip()
+                    title_l = title.casefold().strip()
+                    if domain_l and is_generic_content_domain(domain_l):
+                        if title_l and len(title_l) >= 8 and result.category not in BROAD_PLATFORM_CATEGORIES:
+                            learned_rules.append((title_l[:120], result.category, "title", "online"))
+                    elif domain_l and result.confidence >= 0.68:
+                        learned_rules.append((domain_l, result.category, "domain", "online"))
+                    elif exe_l and len(exe_l) >= 3 and "browser" not in exe_l:
+                        learned_rules.append((exe_l, result.category, "app", "online"))
+                    elif title_l and len(title_l) >= 8:
+                        learned_rules.append((title_l[:80], result.category, "title", "online"))
+            if online_updates:
+                self.conn.executemany(
+                    """
+                    UPDATE content_usage_daily
+                    SET category = ?
+                    WHERE usage_date = ? AND kind = ? AND exe_path = ? AND content_key = ?
+                    """,
+                    online_updates,
+                )
+            if learned_rules:
+                self.conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO category_rules (pattern, category, target, source)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    learned_rules,
+                )
+                self._category_rules_cache = None
+
+        self.conn.commit()
+        remaining = self.conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM content_usage_daily
+            WHERE category IN ('其他', '视频', '网站', '浏览器', '工具')
+              AND learning_topic = ''
+            """
+        ).fetchone()
+        stats["remaining"] = int(remaining["n"] or 0)
+        return stats
 
     def add_timeline_event(
         self,
@@ -1648,22 +1970,32 @@ class Storage:
         ).fetchone()
         return float(row["total"] or 0)
 
-    def overview_counts_range(self, start_date: date, end_date: date) -> dict[str, float | int]:
-        """Small aggregate used by the overview tab without loading detail tables."""
+    def overview_metrics_range(self, start_date: date, end_date: date) -> dict[str, float | int]:
+        """Totals and small counts for the stats header in one indexed pass.
+
+        The stats dialog calls this for the current and previous range. Keeping
+        it compact avoids the multi-query burst that made 30-day views feel
+        frozen on larger local databases.
+        """
         s = start_date.isoformat()
         e = end_date.isoformat()
-        process_row = self.conn.execute(
-            """
-            SELECT COUNT(DISTINCT exe_path) AS program_count
-            FROM usage_daily
-            WHERE usage_date BETWEEN ? AND ?
-            """,
-            (s, e),
-        ).fetchone()
-        content_row = self.conn.execute(
+        row = self.conn.execute(
             """
             SELECT
+                (SELECT COALESCE(SUM(foreground_seconds), 0)
+                   FROM usage_daily
+                  WHERE usage_date BETWEEN ? AND ?) AS foreground,
+                (SELECT COUNT(DISTINCT exe_path)
+                   FROM usage_daily
+                  WHERE usage_date BETWEEN ? AND ?) AS program_count,
                 COALESCE(SUM(CASE WHEN kind = 'web_page' THEN attention_seconds ELSE 0 END), 0) AS web_attention,
+                COALESCE(SUM(CASE WHEN kind = 'video_playback' THEN background_seconds ELSE 0 END), 0) AS video,
+                COALESCE(SUM(CASE
+                    WHEN kind = 'media_playback' OR (kind = 'video_playback' AND category = '音乐')
+                    THEN background_seconds ELSE 0 END), 0) AS media,
+                COALESCE(SUM(CASE
+                    WHEN category = '学习' OR learning_topic != ''
+                    THEN attention_seconds + background_seconds ELSE 0 END), 0) AS learning,
                 COUNT(DISTINCT CASE WHEN kind = 'web_page'
                     THEN kind || ':' || exe_path || ':' || content_key END) AS web_count,
                 COUNT(DISTINCT CASE WHEN kind = 'video_playback'
@@ -1681,17 +2013,35 @@ class Storage:
             FROM content_usage_daily
             WHERE usage_date BETWEEN ? AND ?
             """,
-            (s, e),
+            (s, e, s, e, s, e),
         ).fetchone()
         return {
-            "program_count": int(process_row["program_count"] or 0),
-            "web_attention": float(content_row["web_attention"] or 0),
-            "web_count": int(content_row["web_count"] or 0),
-            "video_count": int(content_row["video_count"] or 0),
-            "music_count": int(content_row["music_count"] or 0),
-            "web_domain_count": int(content_row["web_domain_count"] or 0),
-            "category_count": int(content_row["category_count"] or 0),
-            "learning_topic_count": int(content_row["learning_topic_count"] or 0),
+            "foreground": float(row["foreground"] or 0),
+            "media": float(row["media"] or 0),
+            "video": float(row["video"] or 0),
+            "learning": float(row["learning"] or 0),
+            "program_count": int(row["program_count"] or 0),
+            "web_attention": float(row["web_attention"] or 0),
+            "web_count": int(row["web_count"] or 0),
+            "video_count": int(row["video_count"] or 0),
+            "music_count": int(row["music_count"] or 0),
+            "web_domain_count": int(row["web_domain_count"] or 0),
+            "category_count": int(row["category_count"] or 0),
+            "learning_topic_count": int(row["learning_topic_count"] or 0),
+        }
+
+    def overview_counts_range(self, start_date: date, end_date: date) -> dict[str, float | int]:
+        """Small aggregate used by the overview tab without loading detail tables."""
+        metrics = self.overview_metrics_range(start_date, end_date)
+        return {
+            "program_count": int(metrics["program_count"]),
+            "web_attention": float(metrics["web_attention"]),
+            "web_count": int(metrics["web_count"]),
+            "video_count": int(metrics["video_count"]),
+            "music_count": int(metrics["music_count"]),
+            "web_domain_count": int(metrics["web_domain_count"]),
+            "category_count": int(metrics["category_count"]),
+            "learning_topic_count": int(metrics["learning_topic_count"]),
         }
 
     def day_total_media_playback(self, target_date: date | None = None) -> float:
@@ -2236,50 +2586,33 @@ class Storage:
         ).fetchall()
 
     def hourly_activity_range(self, start_date: date, end_date: date) -> list[tuple[int, float, float, float, float]]:
+        buckets = [[0.0, 0.0, 0.0, 0.0] for _ in range(24)]
         rows = self.conn.execute(
             """
-            SELECT start_time, end_time, kind, category, learning_topic, seconds
+            SELECT CAST(substr(start_time, 12, 2) AS INTEGER) AS hour,
+                   COALESCE(SUM(CASE WHEN kind NOT IN ('video_playback', 'media_playback', 'idle')
+                       THEN seconds ELSE 0 END), 0) AS focus_seconds,
+                   COALESCE(SUM(CASE WHEN kind = 'video_playback'
+                       THEN seconds ELSE 0 END), 0) AS video_seconds,
+                   COALESCE(SUM(CASE WHEN kind = 'media_playback'
+                       THEN seconds ELSE 0 END), 0) AS music_seconds,
+                   COALESCE(SUM(CASE WHEN category = '学习' OR learning_topic != ''
+                       THEN seconds ELSE 0 END), 0) AS learning_seconds
             FROM timeline_events
             WHERE event_date BETWEEN ? AND ?
               AND kind != 'idle'
               AND seconds > 0
-            ORDER BY start_time
+              AND length(start_time) >= 13
+            GROUP BY CAST(substr(start_time, 12, 2) AS INTEGER)
             """,
             (start_date.isoformat(), end_date.isoformat()),
         ).fetchall()
-        buckets = [[0.0, 0.0, 0.0, 0.0] for _ in range(24)]
         for row in rows:
-            try:
-                start = datetime.fromisoformat(str(row["start_time"]))
-                end = datetime.fromisoformat(str(row["end_time"]))
-                seconds = float(row["seconds"] or 0)
-            except Exception:
-                continue
-            if seconds <= 0:
-                continue
-            if end <= start:
-                end = start + timedelta(seconds=seconds)
-            actual_seconds = max(0.001, (end - start).total_seconds())
-            scale = seconds / actual_seconds
-            cursor = start
-            kind = str(row["kind"] or "")
-            category = str(row["category"] or "")
-            learning_topic = str(row["learning_topic"] or "")
-            is_learning = category == "学习" or bool(learning_topic)
-            while cursor < end:
-                next_hour = (cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-                segment_end = min(end, next_hour)
-                segment_seconds = max(0.0, (segment_end - cursor).total_seconds()) * scale
-                hour = max(0, min(23, cursor.hour))
-                if kind == "video_playback":
-                    buckets[hour][1] += segment_seconds
-                elif kind == "media_playback":
-                    buckets[hour][2] += segment_seconds
-                else:
-                    buckets[hour][0] += segment_seconds
-                if is_learning:
-                    buckets[hour][3] += segment_seconds
-                cursor = segment_end
+            hour = max(0, min(23, int(row["hour"] or 0)))
+            buckets[hour][0] = float(row["focus_seconds"] or 0)
+            buckets[hour][1] = float(row["video_seconds"] or 0)
+            buckets[hour][2] = float(row["music_seconds"] or 0)
+            buckets[hour][3] = float(row["learning_seconds"] or 0)
         return [(hour, values[0], values[1], values[2], values[3]) for hour, values in enumerate(buckets)]
 
     def category_summary_range(self, start_date: date, end_date: date) -> list[sqlite3.Row]:
@@ -2300,17 +2633,95 @@ class Storage:
             (start_date.isoformat(), end_date.isoformat()),
         ).fetchall()
 
-    def timeline_rows_range(self, start_date: date, end_date: date, limit: int = 300) -> list[sqlite3.Row]:
+    def _timeline_query_parts(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        query: str = "",
+        kind: str = "",
+        min_seconds: float = 0.0,
+    ) -> tuple[str, list[object]]:
+        conditions = ["event_date BETWEEN ? AND ?"]
+        params: list[object] = [start_date.isoformat(), end_date.isoformat()]
+        kind = (kind or "").strip()
+        if kind:
+            conditions.append("kind = ?")
+            params.append(kind)
+        if min_seconds > 0:
+            conditions.append("seconds >= ?")
+            params.append(float(min_seconds))
+        terms = [term for term in (query or "").casefold().split() if term][:5]
+        for term in terms:
+            like = f"%{term}%"
+            conditions.append(
+                "("
+                "lower(title) LIKE ? OR lower(app_name) LIKE ? OR "
+                "lower(category) LIKE ? OR lower(learning_topic) LIKE ? OR lower(extra) LIKE ?"
+                ")"
+            )
+            params.extend([like, like, like, like, like])
+        return " AND ".join(conditions), params
+
+    def timeline_rows_range(
+        self,
+        start_date: date,
+        end_date: date,
+        limit: int = 300,
+        *,
+        query: str = "",
+        kind: str = "",
+        min_seconds: float = 0.0,
+        sort: str = "recent",
+    ) -> list[sqlite3.Row]:
+        limit = max(1, min(5000, int(limit)))
+        where_sql, params = self._timeline_query_parts(
+            start_date,
+            end_date,
+            query=query,
+            kind=kind,
+            min_seconds=min_seconds,
+        )
+        order_sql = {
+            "duration": "seconds DESC, start_time DESC",
+            "oldest": "start_time ASC",
+        }.get(sort, "start_time DESC")
         return self.conn.execute(
-            """
+            f"""
             SELECT *
             FROM timeline_events
-            WHERE event_date BETWEEN ? AND ?
-            ORDER BY start_time DESC
+            WHERE {where_sql}
+            ORDER BY {order_sql}
             LIMIT ?
             """,
-            (start_date.isoformat(), end_date.isoformat(), limit),
+            [*params, limit],
         ).fetchall()
+
+    def timeline_query_summary_range(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        query: str = "",
+        kind: str = "",
+        min_seconds: float = 0.0,
+    ) -> dict[str, float | int]:
+        where_sql, params = self._timeline_query_parts(
+            start_date,
+            end_date,
+            query=query,
+            kind=kind,
+            min_seconds=min_seconds,
+        )
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS count, COALESCE(SUM(seconds), 0) AS seconds
+            FROM timeline_events
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchone()
+        return {"count": int(row["count"] or 0), "seconds": float(row["seconds"] or 0)}
 
     def goal_rows(self) -> list[sqlite3.Row]:
         return self.conn.execute(
