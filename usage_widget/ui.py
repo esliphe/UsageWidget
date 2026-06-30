@@ -88,13 +88,13 @@ COLLAPSED_SIZE = (500, 118)
 MAX_ICON_CACHE_SIZE = 200
 _APP_ICON_CACHE: QIcon | None = None
 UI_FONT_CANDIDATES = (
-    "Noto Sans SC",
     "Microsoft YaHei UI",
     "Microsoft YaHei",
+    "Segoe UI",
+    "Noto Sans SC",
     "SimSun",
     "Noto Sans CJK SC",
     "Source Han Sans SC",
-    "Segoe UI",
     "Arial",
 )
 COMMON_CATEGORY_CHOICES = (
@@ -182,7 +182,9 @@ def ui_font_stack() -> str:
 def apply_app_font(app: QApplication) -> None:
     loaded = load_bundled_fonts()
     family = ui_font_family()
-    app.setFont(QFont(family, 9))
+    font = QFont(family, 10)
+    font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+    app.setFont(font)
     try:
         bundled = f"；已加载随包字体：{', '.join(loaded)}" if loaded else ""
         log_event(f"UI 字体：{ui_font_status_text()}{bundled}")
@@ -3800,6 +3802,7 @@ class UsageWidgetWindow(QWidget):
         self._last_stats_refresh = 0.0
         self._last_widget_refresh = 0.0
         self._last_saved_pos: tuple[int, int] | None = None
+        self._interaction_lock_until = 0.0
         self._footer_cache_at = 0.0
         self._footer_cache_text = "当前运行 · 当前优先，其余按今日前台时长降序"
         self._collapsed_media_cache_at = -float("inf")
@@ -3814,7 +3817,7 @@ class UsageWidgetWindow(QWidget):
         self._hover_collapse_timer.setSingleShot(True)
         self._hover_collapse_timer.timeout.connect(self._collapse_from_hover)
         self._resize_animation = QPropertyAnimation(self, b"geometry", self)
-        self._resize_animation.setDuration(140)
+        self._resize_animation.setDuration(160)
         self._resize_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._target_fixed_size: QSize | None = None
         self._resize_animation.finished.connect(self._finish_resize_animation)
@@ -3944,18 +3947,20 @@ class UsageWidgetWindow(QWidget):
         self.top_sort_combo.addItem("前台排行", "foreground")
         self.top_sort_combo.addItem("运行排行", "running")
         self.top_sort_combo.addItem("按名称", "name")
-        self.top_sort_combo.setFixedWidth(112)
+        self.top_sort_combo.setFixedWidth(128)
         sort_index = self.top_sort_combo.findData(self.settings.top_list_sort)
         self.top_sort_combo.setCurrentIndex(sort_index if sort_index >= 0 else 0)
         self.top_sort_combo.currentIndexChanged.connect(self.change_top_list_sort)
+        self.top_sort_combo.installEventFilter(self)
+        self.top_sort_combo.view().installEventFilter(self)
 
-        self.collapse_button = self._make_header_button("⌖", "固定展开")
+        self.collapse_button = self._make_header_button(QStyle.StandardPixmap.SP_TitleBarShadeButton, "固定展开")
         self.collapse_button.clicked.connect(self.toggle_pin_mode)
-        self.status_button = self._make_header_button("ℹ", "当前状态")
+        self.status_button = self._make_header_button(QStyle.StandardPixmap.SP_MessageBoxInformation, "当前状态")
         self.status_button.clicked.connect(self.open_status_center)
-        self.stats_button = self._make_header_button("▥", "数据详情")
+        self.stats_button = self._make_header_button(QStyle.StandardPixmap.SP_FileDialogDetailedView, "数据详情")
         self.stats_button.clicked.connect(self.open_stats)
-        self.settings_button = self._make_header_button("⚙", "设置")
+        self.settings_button = self._make_header_button(QStyle.StandardPixmap.SP_DialogResetButton, "设置")
         self.settings_button.clicked.connect(self.open_settings)
         header_layout.addWidget(self.collapse_button)
         header_layout.addWidget(self.status_button)
@@ -4060,9 +4065,10 @@ class UsageWidgetWindow(QWidget):
         ):
             widget.installEventFilter(self)
 
-    def _make_header_button(self, text: str, tooltip: str) -> QToolButton:
+    def _make_header_button(self, icon: QStyle.StandardPixmap, tooltip: str) -> QToolButton:
         button = QToolButton()
-        button.setText(text)
+        button.setIcon(self.style().standardIcon(icon))
+        button.setIconSize(QSize(16, 16))
         button.setToolTip(tooltip)
         button.setAccessibleName(tooltip)
         button.setFixedSize(38, 30)
@@ -4093,6 +4099,28 @@ class UsageWidgetWindow(QWidget):
         layout.addWidget(value_label)
         parent_layout.addWidget(box, 1)
         return value_label
+
+    def _sync_mode_widgets(self, expanded: bool) -> None:
+        if not hasattr(self, "full_panel") or not hasattr(self, "collapsed_bar"):
+            return
+        self.full_panel.setMinimumHeight(0)
+        self.collapsed_bar.setMinimumHeight(0)
+        self.full_panel.setMaximumHeight(16777215 if expanded else 0)
+        self.collapsed_bar.setMaximumHeight(0 if expanded else 16777215)
+        self.full_panel.setVisible(expanded)
+        self.collapsed_bar.setVisible(not expanded)
+        self.full_panel.updateGeometry()
+        self.collapsed_bar.updateGeometry()
+
+    def _mode_widgets_synced(self, expanded: bool) -> bool:
+        if not hasattr(self, "full_panel") or not hasattr(self, "collapsed_bar"):
+            return True
+        return (
+            self.full_panel.isVisible() == expanded
+            and self.collapsed_bar.isVisible() != expanded
+            and self.full_panel.maximumHeight() == (16777215 if expanded else 0)
+            and self.collapsed_bar.maximumHeight() == (0 if expanded else 16777215)
+        )
 
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(build_app_icon(), self)
@@ -4172,7 +4200,7 @@ class UsageWidgetWindow(QWidget):
         self.raise_()
         self.activateWindow()
         self._last_widget_refresh = 0.0
-        self.refresh()
+        QTimer.singleShot(50, self.refresh)
         self._sync_tray_actions(True)
 
     def check_daily_summary(self) -> None:
@@ -4211,18 +4239,21 @@ class UsageWidgetWindow(QWidget):
         self.keep_on_screen()
         self._last_saved_pos = (self.pos().x(), self.pos().y())
 
-    def _clamped_position(self, pos: QPoint) -> QPoint:
-        center = pos + QPoint(max(1, self.width() // 2), max(1, self.height() // 2))
+    def _clamped_position_for_size(self, pos: QPoint, size: QSize) -> QPoint:
+        center = pos + QPoint(max(1, size.width() // 2), max(1, size.height() // 2))
         screen = QApplication.screenAt(center) or QApplication.screenAt(self.pos()) or QApplication.primaryScreen()
         if not screen:
             return pos
         geo = screen.availableGeometry()
         margin = 8
-        max_x = max(geo.left() + margin, geo.right() - self.width() + 1 - margin)
-        max_y = max(geo.top() + margin, geo.bottom() - self.height() + 1 - margin)
+        max_x = max(geo.left() + margin, geo.right() - size.width() + 1 - margin)
+        max_y = max(geo.top() + margin, geo.bottom() - size.height() + 1 - margin)
         x = min(max(pos.x(), geo.left() + margin), max_x)
         y = min(max(pos.y(), geo.top() + margin), max_y)
         return QPoint(x, y)
+
+    def _clamped_position(self, pos: QPoint) -> QPoint:
+        return self._clamped_position_for_size(pos, self.size())
 
     def keep_on_screen(self) -> None:
         clamped = self._clamped_position(self.pos())
@@ -4389,6 +4420,12 @@ class UsageWidgetWindow(QWidget):
             QLabel#collapsedActivityBadge[category="新闻"] {{
                 background: {category_color("新闻")};
             }}
+            QLabel#collapsedActivityBadge[category="打字"] {{
+                background: {category_color("打字")};
+            }}
+            QLabel#collapsedActivityBadge[category="网站"] {{
+                background: {category_color("网站")};
+            }}
             QLabel#collapsedMetric {{
                 color: {text};
                 font-size: 11px;
@@ -4523,12 +4560,13 @@ class UsageWidgetWindow(QWidget):
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
+        self._sync_mode_widgets(not self.is_collapsed)
         self._sync_tray_actions(True)
         apply_windows_backdrop(self, is_dark_theme(self.settings))
         self._last_widget_refresh = 0.0
         self._footer_cache_at = 0.0
         self._footer_cache_text = "当前运行 · " + self._top_list_sort_label()
-        self.refresh()
+        QTimer.singleShot(50, self.refresh)
         if not hasattr(self, "_summary_checked_today"):
             self._summary_checked_today = True
             QTimer.singleShot(800, self.check_daily_summary)
@@ -4552,16 +4590,36 @@ class UsageWidgetWindow(QWidget):
         self._pointer_inside = True
         self._hover_collapse_timer.stop()
         if not self.settings.always_expanded and self.is_collapsed:
-            self._hover_expand_timer.start(220)
+            self._hover_expand_timer.start(180)
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
         super().leaveEvent(event)
         self._pointer_inside = False
         self._hover_expand_timer.stop()
-        if not self.settings.always_expanded and not self.drag_pos:
-            self._hover_collapse_timer.start(360)
+        if not self.settings.always_expanded and not self.drag_pos and not self._interaction_locked():
+            self._hover_collapse_timer.start(260)
 
     def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
+        if obj in (getattr(self, "top_sort_combo", None), getattr(getattr(self, "top_sort_combo", None), "view", lambda: None)()):
+            if event.type() in {
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseButtonRelease,
+                QEvent.Type.FocusIn,
+                QEvent.Type.FocusOut,
+            }:
+                self._hold_expanded(700)
+                self._hover_collapse_timer.stop()
+                if not self.settings.always_expanded and self.is_collapsed:
+                    self.set_expanded(True)
+            if event.type() in {
+                QEvent.Type.Show,
+                QEvent.Type.Hide,
+            }:
+                if not self.is_collapsed:
+                    self._hold_expanded(500)
+                    self._hover_collapse_timer.stop()
+            if event.type() == QEvent.Type.Wheel:
+                self._hold_expanded(500)
         is_collapsed_drag_handle = obj in getattr(self, "_collapsed_drag_widgets", set())
         if is_collapsed_drag_handle and self.is_collapsed and not self.settings.always_expanded:
             if event.type() == QEvent.Type.Enter:
@@ -4569,7 +4627,7 @@ class UsageWidgetWindow(QWidget):
                 return False
             if event.type() == QEvent.Type.Leave:
                 if self._pointer_inside and not self.drag_pos:
-                    self._hover_expand_timer.start(260)
+                    self._hover_expand_timer.start(180)
                 return False
         if event.type() == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
             can_drag = (not self.is_collapsed) or is_collapsed_drag_handle
@@ -4611,30 +4669,37 @@ class UsageWidgetWindow(QWidget):
             if was_click:
                 self.set_expanded(True)
                 return True
-            if not self._pointer_inside and not self.settings.always_expanded:
+            if not self._pointer_inside and not self.settings.always_expanded and not self._interaction_locked():
                 self._hover_collapse_timer.start(220)
         return super().eventFilter(obj, event)
 
     def set_expanded(self, expanded: bool) -> None:
         self._sync_pin_button()
-        if self.is_collapsed == (not expanded) and self.full_panel.isVisible() == expanded:
-            return
-        self.is_collapsed = not expanded
-        self.full_panel.setVisible(expanded)
-        self.collapsed_bar.setVisible(not expanded)
         width, height = FULL_SIZE if expanded else COLLAPSED_SIZE
         target_size = QSize(width, height)
-        if self.isVisible():
-            start = self.geometry()
-            target = QRect(start.topLeft(), target_size)
+        already_synced = (
+            self.is_collapsed == (not expanded)
+            and self._mode_widgets_synced(expanded)
+            and self.size() == target_size
+        )
+        if already_synced:
+            return
+        self.is_collapsed = not expanded
+        self._sync_mode_widgets(expanded)
+        if self.isVisible() and self.size() != target_size:
             self._resize_animation.stop()
+            start = self.geometry()
             self.setMinimumSize(QSize(0, 0))
             self.setMaximumSize(QSize(16777215, 16777215))
             self._target_fixed_size = target_size
+            target = QRect(self._clamped_position_for_size(start.topLeft(), target_size), target_size)
+            self._resize_animation.setDuration(150 if expanded else 95)
             self._resize_animation.setStartValue(start)
             self._resize_animation.setEndValue(target)
             self._resize_animation.start()
         else:
+            self._resize_animation.stop()
+            self._target_fixed_size = None
             self.setFixedSize(target_size)
         self.keep_on_screen()
 
@@ -4642,6 +4707,7 @@ class UsageWidgetWindow(QWidget):
         if self._target_fixed_size is not None:
             self.setFixedSize(self._target_fixed_size)
             self._target_fixed_size = None
+            self._sync_mode_widgets(not self.is_collapsed)
             self.keep_on_screen()
 
     def _expand_from_hover(self) -> None:
@@ -4649,16 +4715,24 @@ class UsageWidgetWindow(QWidget):
             self.set_expanded(True)
 
     def _collapse_from_hover(self) -> None:
-        if not self._pointer_inside and not self.settings.always_expanded and not self.drag_pos:
+        if not self._pointer_inside and not self.settings.always_expanded and not self.drag_pos and not self._interaction_locked():
             self.set_expanded(False)
+
+    def _hold_expanded(self, milliseconds: int = 1200) -> None:
+        self._interaction_lock_until = max(self._interaction_lock_until, time.monotonic() + milliseconds / 1000.0)
+
+    def _interaction_locked(self) -> bool:
+        combo = getattr(self, "top_sort_combo", None)
+        view = combo.view() if combo is not None else None
+        return time.monotonic() < self._interaction_lock_until or bool(view and view.isVisible())
 
     def _sync_pin_button(self) -> None:
         if self.settings.always_expanded:
-            self.collapse_button.setText("⌕")
+            self.collapse_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarUnshadeButton))
             self.collapse_button.setToolTip("取消固定，改为悬停展开")
             self.collapse_button.setAccessibleName("取消固定，改为悬停展开")
         else:
-            self.collapse_button.setText("⌖")
+            self.collapse_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarShadeButton))
             self.collapse_button.setToolTip("固定展开")
             self.collapse_button.setAccessibleName("固定展开")
 
@@ -4730,6 +4804,21 @@ class UsageWidgetWindow(QWidget):
         clean = [str(title).strip() for title in titles if str(title).strip()]
         return " / ".join(clean[:limit])
 
+    def _is_foreground_browser_exe(self, exe_name: str) -> bool:
+        exe_l = (exe_name or "").casefold()
+        return any(
+            hint in exe_l
+            for hint in ("msedge", "chrome", "firefox", "browser", "brave", "opera", "vivaldi")
+        )
+
+    def _current_activity_tab(self, category: str, exe_name: str):
+        if self._is_foreground_browser_exe(exe_name) or category in {"网站", "浏览器"}:
+            try:
+                return self.monitor.browser_bridge.latest(max_age_seconds=30)
+            except Exception as exc:
+                log_event(f"读取当前活动标签失败: {type(exc).__name__}: {exc}")
+        return None
+
     def _activity_label(self) -> str:
         """Build a human-readable label for the current foreground activity."""
         if self.monitor.is_paused or self.monitor.is_idle:
@@ -4763,7 +4852,7 @@ class UsageWidgetWindow(QWidget):
             "dingtalk": "钉钉",
         }
         display_exe = friendly_names.get(exe_name.lower(), exe_name) if exe_name else ""
-        latest_tab = self.monitor.browser_bridge.latest(max_age_seconds=30)
+        latest_tab = self._current_activity_tab(category or "", exe or "")
         domain = str(getattr(latest_tab, "domain", "") or "") if latest_tab else ""
         title = str(getattr(latest_tab, "title", "") or self.monitor.foreground_title or "")
         short_hint = short_activity_hint(exe or "", domain, title, category or "")
@@ -4779,8 +4868,14 @@ class UsageWidgetWindow(QWidget):
             if display_exe and display_exe.lower() != short_hint.lower():
                 return f"{short_hint} · {display_exe}"
             return short_hint
-        web_hint = low_info_web_hint(domain, title, category or "")
+        web_hint = (
+            low_info_web_hint(domain, title, category or "")
+            if latest_tab or self._is_foreground_browser_exe(exe or "") or category in {"网站", "浏览器"}
+            else ""
+        )
         if web_hint:
+            if not domain and category in {"网站", "浏览器"} and title:
+                return f"网页 · {title[:24]}"
             return web_hint
         if display_exe:
             return display_exe
@@ -4792,19 +4887,29 @@ class UsageWidgetWindow(QWidget):
             return ""
         category = self.monitor.current_category
         topic = self.monitor.current_learning_topic
+        foreground_exe = self.monitor.current_foreground_exe or ""
+        browser_foreground = self._is_foreground_browser_exe(foreground_exe)
+        latest_tab = self._current_activity_tab(category or "", foreground_exe)
+        domain = str(getattr(latest_tab, "domain", "") or "") if latest_tab else ""
+        title = str(getattr(latest_tab, "title", "") or self.monitor.foreground_title or "")
+        short_hint = short_activity_hint(foreground_exe, domain, title, category or "")
         if category and category not in ("其他", "工具", "网站", "浏览器", "系统软件", "办公"):
             return category
         if topic:
             return "学习"
-        latest_tab = self.monitor.browser_bridge.latest(max_age_seconds=30)
-        domain = str(getattr(latest_tab, "domain", "") or "") if latest_tab else ""
-        title = str(getattr(latest_tab, "title", "") or self.monitor.foreground_title or "")
-        short_hint = short_activity_hint(self.monitor.current_foreground_exe or "", domain, title, category or "")
         if short_hint:
             return short_hint
-        web_hint = low_info_web_hint(domain, title, category or "")
+        web_hint = (
+            low_info_web_hint(domain, title, category or "")
+            if browser_foreground or domain or category in {"网站", "浏览器"}
+            else ""
+        )
         if web_hint:
-            return "网页" if domain else "未识别"
+            return "网页" if domain or category in {"网站", "浏览器"} else "未识别"
+        if self.monitor.current_media_titles:
+            return "音乐"
+        if self.monitor.current_video_titles:
+            return "视频"
         if self.monitor.current_foreground_exe:
             return "使用中"
         return ""
@@ -4905,6 +5010,8 @@ class UsageWidgetWindow(QWidget):
             activity_cat = self.monitor.current_category
             if self.monitor.current_learning_topic and not activity_cat:
                 activity_cat = "学习"
+            if activity_short in {"音乐", "视频", "打字", "网页"} and activity_cat in {"", None, "其他", "工具", "网站", "浏览器"}:
+                activity_cat = "网站" if activity_short == "网页" else activity_short
             self.collapsed_activity_badge.setProperty("category", activity_cat or "其他")
             self.collapsed_activity_badge.style().unpolish(self.collapsed_activity_badge)
             self.collapsed_activity_badge.style().polish(self.collapsed_activity_badge)
@@ -4919,7 +5026,7 @@ class UsageWidgetWindow(QWidget):
         self.collapsed_music_metric.setText(f"音乐 {format_duration(media_total)}")
         self.collapsed_learning_metric.setText(f"学习 {format_duration(learning_total)}")
         media_label, media_text = self._collapsed_media_text()
-        if media_text == "暂无正在播放的音乐" and activity_label:
+        if activity_label:
             self._set_elided_text(self.collapsed_music, f"当前 · {activity_label}", COLLAPSED_SIZE[0] - 64)
         else:
             self._set_elided_text(self.collapsed_music, f"{media_label} · {media_text}", COLLAPSED_SIZE[0] - 64)
@@ -4970,14 +5077,14 @@ class UsageWidgetWindow(QWidget):
             self.goal_strip.setVisible(True)
         else:
             self.goal_strip.setVisible(False)
-        if self.monitor.current_media_titles:
-            self.footer_label.setText("正在播放 · " + " / ".join(self.monitor.current_media_titles[:2]))
-        elif self.monitor.current_video_titles:
-            self.footer_label.setText("视频播放 · " + " / ".join(self.monitor.current_video_titles[:2]))
-        elif activity_label:
+        if activity_label:
             self.footer_label.setText("当前 · " + activity_label)
             self._footer_cache_text = "当前 · " + activity_label
             self._footer_cache_at = now_mono
+        elif self.monitor.current_media_titles:
+            self.footer_label.setText("正在播放 · " + " / ".join(self.monitor.current_media_titles[:2]))
+        elif self.monitor.current_video_titles:
+            self.footer_label.setText("视频播放 · " + " / ".join(self.monitor.current_video_titles[:2]))
         else:
             if now_mono - self._footer_cache_at >= 15.0:
                 top_web = self.storage.top_content(kind="web_page", limit=1)

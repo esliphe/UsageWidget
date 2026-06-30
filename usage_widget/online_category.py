@@ -786,6 +786,8 @@ class OnlineCategoryClassifier:
         text_l = (text or "").casefold()
         if not text_l:
             return "其他", 0.0
+        if "codex" in text_l or "openai codex" in text_l:
+            return "AI 工具", 0.92
         scores: dict[str, int] = {}
         for category, hints in self.CATEGORY_HINTS.items():
             score = 0

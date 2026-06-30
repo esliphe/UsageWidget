@@ -13,6 +13,7 @@ from .classification import (
     BROAD_PLATFORM_CATEGORIES,
     clean_lookup_title,
     is_generic_content_domain,
+    looks_like_video_content,
     normalize_lookup_text,
 )
 from .content import classify_window_content, extract_onenote_info
@@ -159,6 +160,7 @@ class ProcessMonitor(QObject):
         self.idle_seconds = 0.0
         self.is_idle = False
         self.is_paused = False
+        self._started = False
         self.last_sample_ms = 0.0
         self.max_sample_ms = 0.0
         self.last_process_scan_ms = 0.0
@@ -180,6 +182,29 @@ class ProcessMonitor(QObject):
             return False
         return exe in MEDIA_BROWSER_HINTS or any(hint in exe for hint in MEDIA_BROWSER_HINTS)
 
+    def _is_browser_process(self, exe_name: str) -> bool:
+        return self._is_generic_browser_process(exe_name)
+
+    def _is_typing_context(self, domain: str = "", title: str = "", url: str = "") -> bool:
+        text = " ".join((domain or "", title or "", url or "")).casefold()
+        typing_hints = (
+            "dazidazi",
+            "monkeytype",
+            "10fastfingers",
+            "keybr.com",
+            "typing.com",
+            "typingclub.com",
+            "typing practice",
+            "type practice",
+            "keyboard practice",
+            "words per minute",
+            "wpm",
+            "打字",
+            "打字练习",
+            "键盘练习",
+        )
+        return any(item in text for item in typing_hints)
+
     def _is_generic_content_domain(self, domain: str) -> bool:
         return is_generic_content_domain(domain)
 
@@ -199,16 +224,18 @@ class ProcessMonitor(QObject):
         hints = category_hints.get(category, ())
         return any(hint in domain_l for hint in hints)
 
-    def _refine_generic_content_category(self, category: str, exe_name: str, domain: str, title: str) -> str:
+    def _refine_generic_content_category(self, category: str, exe_name: str, domain: str, title: str, url: str = "") -> str:
         if not self._is_generic_content_domain(domain):
             return category
         if category not in BROAD_PLATFORM_CATEGORIES:
             return category
         local = self._fallback_category_for(exe_name, "", clean_lookup_title(domain, title))
         if local in {"其他", "工具", "浏览器", "网站"}:
+            if category == "视频" and not looks_like_video_content(domain, title, url):
+                return "网站"
             return category
-        if local == "视频" and category != "网站":
-            return category
+        if local == "视频":
+            return "视频" if looks_like_video_content(domain, title, url) else "网站"
         return local
 
     def _should_refine_generic_content_online(self, category: str, domain: str, title: str, settings) -> bool:
@@ -218,7 +245,10 @@ class ProcessMonitor(QObject):
             return False
         if not self._is_generic_content_domain(domain):
             return False
-        return len(normalize_lookup_text(domain, clean_lookup_title(domain, title))) >= 8
+        clean_title = clean_lookup_title(domain, title)
+        if len(clean_title) < 4:
+            return False
+        return len(normalize_lookup_text(clean_title)) >= 8
 
     def _remember_online_category_rule(
         self,
@@ -293,11 +323,15 @@ class ProcessMonitor(QObject):
                 self.music_verifier.queue(title, domain)
         return False
 
-    def _category_for(self, exe_name: str, domain: str, title: str, settings) -> str:
+    def _category_for(self, exe_name: str, domain: str, title: str, settings, url: str = "") -> str:
         clean_title = clean_lookup_title(domain, title)
+        if self._is_codex_context(exe_name, domain, clean_title):
+            return "AI 工具"
+        if self._is_typing_context(domain, clean_title, url):
+            return "打字"
         category = self.storage.category_for(exe_name, domain, clean_title)
         if category != "其他":
-            refined_category = self._refine_generic_content_category(category, exe_name, domain, clean_title)
+            refined_category = self._refine_generic_content_category(category, exe_name, domain, clean_title, url)
             if self._should_refine_generic_content_online(category, domain, clean_title, settings):
                 result = self.category_classifier.cached(exe_name, domain, clean_title)
                 if result:
@@ -309,7 +343,7 @@ class ProcessMonitor(QObject):
                     self.category_classifier.queue(exe_name, domain, clean_title)
             return refined_category
         if not settings.online_category_lookup or settings.private_title_mode:
-            return self._fallback_category_for(exe_name, domain, clean_title)
+            return self._fallback_category_for(exe_name, domain, clean_title, url=url)
         result = self.category_classifier.cached(exe_name, domain, clean_title)
         if result:
             if result.category != "其他" and result.confidence >= 0.55:
@@ -318,7 +352,11 @@ class ProcessMonitor(QObject):
         else:
             if len(normalize_text(exe_name, domain, clean_title)) >= 3:
                 self.category_classifier.queue(exe_name, domain, clean_title)
-        return self._fallback_category_for(exe_name, domain, clean_title)
+        return self._fallback_category_for(exe_name, domain, clean_title, url=url)
+
+    def _is_codex_context(self, exe_name: str = "", domain: str = "", title: str = "") -> bool:
+        text = " ".join((exe_name or "", domain or "", title or "")).casefold()
+        return "codex" in text or "openai codex" in text
 
     def _learning_topic_for(
         self,
@@ -387,11 +425,14 @@ class ProcessMonitor(QObject):
             )
         return category
 
-    def _fallback_category_for(self, exe_name: str, domain: str = "", title: str = "") -> str:
+    def _fallback_category_for(self, exe_name: str, domain: str = "", title: str = "", url: str = "") -> str:
         exe = (exe_name or "").casefold()
         domain_l = (domain or "").casefold()
         title_l = clean_lookup_title(domain_l, title).casefold()
         text = f"{exe} {domain_l} {title_l}"
+
+        if self._is_codex_context(exe, domain_l, title_l):
+            return "AI 工具"
 
         if "applicationframehost.exe" in exe and "onenote" in title_l:
             return "学习"
@@ -580,12 +621,10 @@ class ProcessMonitor(QObject):
         if any(item in text for item in office_hints):
             return "办公"
 
-        typing_hints = ("dazidazi", "typing", "type practice", "打字", "打字练习", "键盘练习")
-        if any(item in text for item in typing_hints):
-            return "工具"
+        if self._is_typing_context(domain_l, title_l, url):
+            return "打字"
 
-        video_hints = ("youtube", "bilibili", "b23.tv", "youku", "iqiyi", "video", "movie", "tv", "直播", "视频", "电影", "电视剧")
-        if any(item in text for item in video_hints):
+        if looks_like_video_content(domain_l, title_l, url):
             return "视频"
 
         if exe in MEDIA_BROWSER_HINTS or any(browser in exe for browser in MEDIA_BROWSER_HINTS):
@@ -651,6 +690,8 @@ class ProcessMonitor(QObject):
         ).lower()
         if getattr(tab, "muted", False):
             return "muted"
+        if self._is_typing_context(domain, title, url):
+            return "web_page"
         if self._is_web_music_domain(domain):
             return "media_playback"
         if any(hint in url for hint in ("/playlist", "/album", "/artist", "/song", "/podcast")):
@@ -658,11 +699,21 @@ class ProcessMonitor(QObject):
                 return "media_playback"
         if self._looks_like_music_content(domain, title):
             return "media_playback"
-        if any(domain == item or domain.endswith("." + item) for item in WEB_VIDEO_DOMAIN_HINTS):
+        has_video = bool(getattr(tab, "has_video", False))
+        media_state = (getattr(tab, "media_state", "") or "").casefold()
+        if has_video and media_state in {"playing", "paused", "present"}:
+            return "video_playback"
+        if looks_like_video_content(domain, title, url):
             return "video_playback"
         if getattr(tab, "has_audio", False) and not getattr(tab, "has_video", False):
             return "media_playback"
-        return "video_playback"
+        return "web_page"
+
+    def _browser_tab_has_media_signal(self, tab) -> bool:
+        if not tab or getattr(tab, "muted", False):
+            return False
+        kind = self._browser_playback_kind(tab)
+        return kind in {"video_playback", "media_playback"}
 
     def _music_label(self, title: str, source: str = "", domain: str = "") -> str:
         _song, _artist, label = parse_music_identity(title, source=source, domain=domain)
@@ -678,13 +729,19 @@ class ProcessMonitor(QObject):
             return None
 
     def start(self) -> None:
+        self._started = True
         self.browser_bridge.start()
-        self.sample(write=False)
         self._timer.start(self.interval_ms)
+        QTimer.singleShot(250, self._sample_after_start)
 
     def stop(self) -> None:
+        self._started = False
         self._timer.stop()
         self.browser_bridge.stop()
+
+    def _sample_after_start(self) -> None:
+        if self._started and self._timer.isActive():
+            self.sample(write=False)
 
     def _sample_delta(self, now: datetime, write: bool) -> float:
         if self._last_sample is None:
@@ -801,7 +858,7 @@ class ProcessMonitor(QObject):
                 )
             if settings.track_window_titles and should_count_attention and fg_path and fg_path in groups and fg_title:
                 proc = groups[fg_path]
-                tab = self._latest_browser_tab(settings)
+                tab = self._latest_browser_tab(settings) if self._is_browser_process(proc.exe_name) else None
                 title = tab.title if tab and tab.title else fg_title
                 url = tab.url if tab else ""
                 content = classify_window_content(
@@ -819,7 +876,7 @@ class ProcessMonitor(QObject):
                         getattr(tab, "h1", "") if tab else "",
                         getattr(tab, "description", "") if tab else "",
                     )
-                    category = self._category_for(proc.exe_name, content.domain, page_context, settings)
+                    category = self._category_for(proc.exe_name, content.domain, page_context, settings, url=content.url)
                     if onenote_learning:
                         category = "学习"
                     learning_topic = self._learning_topic_for(
@@ -898,7 +955,7 @@ class ProcessMonitor(QObject):
                         category_text,
                         settings.online_music_lookup and not settings.private_title_mode,
                     )
-                    category = "音乐" if is_music_content else self._category_for("browser", tab.domain, category_text, settings)
+                    category = "音乐" if is_music_content else self._category_for("browser", tab.domain, category_text, settings, url=tab.url)
                     learning_topic = ""
                     if not is_music_content:
                         learning_topic = self._learning_topic_for(
@@ -963,15 +1020,13 @@ class ProcessMonitor(QObject):
                     content_domain = ""
                     if is_browser_media:
                         latest_tab = self._latest_browser_tab(settings)
-                        if latest_tab:
+                        if latest_tab and self._browser_tab_has_media_signal(latest_tab):
                             browser_kind = self._browser_playback_kind(latest_tab)
-                            if browser_kind == "muted":
-                                continue
                             kind = browser_kind
                             content_url = latest_tab.url
                             content_domain = latest_tab.domain
                         else:
-                            kind = "video_playback"
+                            kind = "video_playback" if looks_like_video_content("", display_title) else "media_playback"
                     else:
                         kind = "media_playback"
                     is_music_browser_media = is_browser_media and self._looks_like_music_content_with_lookup(
@@ -985,7 +1040,7 @@ class ProcessMonitor(QObject):
                         category = "音乐"
                         learning_topic = ""
                     else:
-                        category = self._category_for("browser" if is_browser_media else item.source, content_domain, display_title, settings)
+                        category = self._category_for("browser" if is_browser_media else item.source, content_domain, display_title, settings, url=content_url)
                         learning_topic = self._learning_topic_for(
                             category,
                             content_domain,

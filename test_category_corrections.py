@@ -54,6 +54,70 @@ def main() -> None:
 
     storage, temp_dir = fresh_storage()
     try:
+        storage.add_category_rule("chat", "聊天", "domain", update_existing=True, source="online")
+        check(
+            "protected deepseek domain beats broad chat rule",
+            storage.category_for("browser", "chat.deepseek.com", "DeepSeek") == "AI 工具",
+            storage.category_explanation("AI 工具", "browser", "chat.deepseek.com", "DeepSeek"),
+        )
+        storage.add_category_rule("chat.deepseek.com", "办公", "domain", update_existing=True, source="user")
+        check(
+            "specific user correction can still override protected default",
+            storage.category_for("browser", "chat.deepseek.com", "DeepSeek") == "办公",
+            storage.category_explanation("办公", "browser", "chat.deepseek.com", "DeepSeek"),
+        )
+    finally:
+        storage.close()
+        temp_dir.cleanup()
+
+    storage, temp_dir = fresh_storage()
+    try:
+        when = datetime(2026, 1, 2, 10, 0, 0)
+        storage.increment_content_usage(
+            [
+                {
+                    "kind": "web_page",
+                    "exe_name": "browser",
+                    "exe_path": "browser",
+                    "content_key": "web:https://chat.deepseek.com/",
+                    "content_title": "DeepSeek",
+                    "content_url": "https://chat.deepseek.com/",
+                    "content_domain": "chat.deepseek.com",
+                    "category": "聊天",
+                    "learning_topic": "",
+                    "attention_seconds": 120.0,
+                    "background_seconds": 0.0,
+                }
+            ],
+            when,
+        )
+        storage.insert_timeline_events(
+            [
+                {
+                    "start_time": when,
+                    "end_time": when,
+                    "kind": "web_page",
+                    "title": "DeepSeek",
+                    "app_name": "browser",
+                    "app_path": "browser",
+                    "category": "聊天",
+                    "learning_topic": "",
+                    "seconds": 120.0,
+                    "extra": "https://chat.deepseek.com/",
+                }
+            ]
+        )
+        storage._apply_protected_default_rules_to_existing()
+        row = storage.conn.execute("SELECT category FROM content_usage_daily").fetchone()
+        event = storage.conn.execute("SELECT category FROM timeline_events").fetchone()
+        check("protected rules repair deepseek content history", row["category"] == "AI 工具", repr(dict(row)))
+        check("protected rules repair deepseek timeline history", event["category"] == "AI 工具", repr(dict(event)))
+    finally:
+        storage.close()
+        temp_dir.cleanup()
+
+    storage, temp_dir = fresh_storage()
+    try:
         when = datetime(2026, 1, 2, 12, 0, 0)
         storage.increment_content_usage(
             [

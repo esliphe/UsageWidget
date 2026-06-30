@@ -677,7 +677,7 @@ class HeatmapWidget(QWidget):
         self.data: list[tuple[str, float]] = []
         self.metric_label = "学习"
         self._cell_rects: list[tuple[QRectF, str, float]] = []
-        self.setMinimumHeight(155)
+        self.setMinimumHeight(185)
         self.setMouseTracking(True)
 
     def set_data(self, rows: list[tuple[str, float]], metric_label: str = "学习") -> None:
@@ -723,11 +723,16 @@ class HeatmapWidget(QWidget):
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                 f"峰值 {peak_label} {format_duration(peak_value)}",
             )
-        total_cols = (len(self.data) + 6) // 7
-        cell = min(px(self, 15, 15), max(px(self, 9, 9), (rect.width() - 50) / max(total_cols, 1)))
         cell_gap = px(self, 2, 2)
         chart_left = 32
         chart_top = 36
+        total_cols = (len(self.data) + 6) // 7
+        legend_reserved = px(self, 32, 32)
+        available_w = max(px(self, 72, 72), rect.width() - chart_left - px(self, 18, 18))
+        available_h = max(px(self, 64, 64), rect.height() - chart_top - legend_reserved)
+        cell_by_w = available_w / max(total_cols, 1) - cell_gap
+        cell_by_h = available_h / 7 - cell_gap
+        cell = min(px(self, 15, 15), max(px(self, 8, 8), min(cell_by_w, cell_by_h)))
         month_font = painter.font()
         month_font.setPointSize(6)
         month_font.setBold(False)
@@ -771,23 +776,29 @@ class HeatmapWidget(QWidget):
             y = chart_top + i * (cell + cell_gap) + cell / 2 - 4
             painter.drawText(QRectF(4, int(y), 24, 12),
                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, label)
-        legend_y = min(rect.height() - 20, chart_top + 7 * (cell + cell_gap) + 8)
+        legend_y = min(rect.height() - px(self, 20, 20), chart_top + 7 * (cell + cell_gap) + px(self, 10, 10))
         legend_x = chart_left
         legend_font = painter.font()
         legend_font.setPointSize(7)
         painter.setFont(legend_font)
         painter.setPen(QColor("#738196"))
-        painter.drawText(QRectF(legend_x, legend_y, 28, 14), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "少")
-        swatch = px(self, 10, 10)
-        x = legend_x + 24
+        painter.drawText(QRectF(legend_x, legend_y, 20, 14), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "少")
+        swatch = px(self, 9, 9)
+        x = legend_x + 18
         for color in self.COLORS:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(QRectF(x, legend_y + 2, swatch, swatch), 2, 2)
-            x += swatch + px(self, 3, 3)
+            x += swatch + px(self, 2, 2)
         painter.setPen(QColor("#738196"))
         max_label = format_duration(max_val)
-        painter.drawText(QRectF(x + 2, legend_y, min(100, rect.width() - x - 8), 14), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, f"多 {max_label}")
+        remaining_w = max(0, rect.width() - x - px(self, 8, 8))
+        if remaining_w >= 26:
+            painter.drawText(
+                QRectF(x + px(self, 2, 2), legend_y, remaining_w, 14),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                f"多 {max_label}",
+            )
         painter.end()
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]

@@ -42,6 +42,7 @@ DEFAULT_IGNORED = {
     "securityhealthservice.exe",
     "wudfhost.exe",
     "audiodg.exe",
+    "usagewidget.exe",
 }
 
 
@@ -451,10 +452,15 @@ DEFAULT_CATEGORY_RULES += [
     ("slack.com", "聊天", "domain"),
     ("messages.google.com", "聊天", "domain"),
     ("whatsapp.com", "聊天", "domain"),
-    ("dazidazi.com", "工具", "domain"),
-    ("dazidazi", "工具", "title"),
-    ("打字", "工具", "title"),
-    ("typing", "工具", "title"),
+    ("dazidazi.com", "打字", "domain"),
+    ("monkeytype.com", "打字", "domain"),
+    ("10fastfingers.com", "打字", "domain"),
+    ("keybr.com", "打字", "domain"),
+    ("typing.com", "打字", "domain"),
+    ("typingclub.com", "打字", "domain"),
+    ("dazidazi", "打字", "title"),
+    ("打字", "打字", "title"),
+    ("typing", "打字", "title"),
     ("zhihu.com", "学习", "domain"),
     ("csdn.net", "编程", "domain"),
     ("cnblogs.com", "编程", "domain"),
@@ -501,6 +507,33 @@ DEFAULT_CATEGORY_RULES += [
     ("36kr.com", "新闻", "domain"),
     ("新闻", "新闻", "title"),
     ("资讯", "新闻", "title"),
+]
+
+PROTECTED_DEFAULT_CATEGORY_RULES = [
+    ("chatgpt.com", "AI 工具", "domain"),
+    ("claude.ai", "AI 工具", "domain"),
+    ("deepseek.com", "AI 工具", "domain"),
+    ("chat.deepseek.com", "AI 工具", "domain"),
+    ("kimi.moonshot.cn", "AI 工具", "domain"),
+    ("doubao.com", "AI 工具", "domain"),
+    ("yuanbao.tencent.com", "AI 工具", "domain"),
+    ("poe.com", "AI 工具", "domain"),
+    ("perplexity.ai", "AI 工具", "domain"),
+    ("codex", "AI 工具", "title"),
+    ("openai codex", "AI 工具", "title"),
+    ("deepseek", "AI 工具", "title"),
+    ("kimi", "AI 工具", "title"),
+    ("豆包", "AI 工具", "title"),
+    ("腾讯元宝", "AI 工具", "title"),
+    ("dazidazi.com", "打字", "domain"),
+    ("monkeytype.com", "打字", "domain"),
+    ("10fastfingers.com", "打字", "domain"),
+    ("keybr.com", "打字", "domain"),
+    ("typing.com", "打字", "domain"),
+    ("typingclub.com", "打字", "domain"),
+    ("dazidazi", "打字", "title"),
+    ("打字", "打字", "title"),
+    ("typing", "打字", "title"),
 ]
 
 
@@ -982,8 +1015,28 @@ class Storage:
                 ("聊天", "weixin.exe", "app", "社交"),
                 ("娱乐", "douyin.com", "domain", "视频"),
                 ("娱乐", "weibo.com", "domain", "社交"),
+                ("打字", "dazidazi.com", "domain", "工具"),
+                ("打字", "dazidazi", "title", "工具"),
+                ("打字", "打字", "title", "工具"),
+                ("打字", "typing", "title", "工具"),
             ],
         )
+        self.conn.executemany(
+            """
+            INSERT INTO category_rules (pattern, category, target, source)
+            VALUES (?, ?, ?, 'default')
+            ON CONFLICT(pattern, target) DO UPDATE SET
+                category = excluded.category,
+                source = CASE
+                    WHEN category_rules.source IN ('', 'default', 'online') THEN 'default'
+                    ELSE category_rules.source
+                END
+            WHERE category_rules.source IN ('', 'default', 'online')
+               OR category_rules.category IN ('其他', '聊天', '社交', '网站', '浏览器')
+            """,
+            PROTECTED_DEFAULT_CATEGORY_RULES,
+        )
+        self._category_rules_cache = None
         self._apply_default_category_rules_to_existing()
 
     def _apply_default_category_rules_to_existing(self) -> None:
@@ -1025,6 +1078,53 @@ class Storage:
               AND (lower(exe_name) LIKE '%qq.exe%' OR lower(exe_name) LIKE '%weixin.exe%' OR lower(exe_name) LIKE '%wechat.exe%')
             """
         )
+        self._apply_protected_default_rules_to_existing()
+
+    def _apply_protected_default_rules_to_existing(self) -> None:
+        for pattern, category, target in PROTECTED_DEFAULT_CATEGORY_RULES:
+            like = f"%{pattern.lower()}%"
+            if target == "domain":
+                self.conn.execute(
+                    """
+                    UPDATE content_usage_daily
+                    SET category = ?,
+                        learning_topic = CASE WHEN ? = '学习' THEN learning_topic ELSE '' END
+                    WHERE lower(content_domain) LIKE ?
+                      AND category IN ('其他', '聊天', '社交', '网站', '浏览器', '工具', '打字')
+                    """,
+                    (category, category, like),
+                )
+                self.conn.execute(
+                    """
+                    UPDATE timeline_events
+                    SET category = ?,
+                        learning_topic = CASE WHEN ? = '学习' THEN learning_topic ELSE '' END
+                    WHERE lower(extra) LIKE ?
+                      AND category IN ('其他', '聊天', '社交', '网站', '浏览器', '工具', '打字')
+                    """,
+                    (category, category, like),
+                )
+            elif target == "title":
+                self.conn.execute(
+                    """
+                    UPDATE content_usage_daily
+                    SET category = ?,
+                        learning_topic = CASE WHEN ? = '学习' THEN learning_topic ELSE '' END
+                    WHERE lower(content_title) LIKE ?
+                      AND category IN ('其他', '聊天', '社交', '网站', '浏览器', '工具', '打字')
+                    """,
+                    (category, category, like),
+                )
+                self.conn.execute(
+                    """
+                    UPDATE timeline_events
+                    SET category = ?,
+                        learning_topic = CASE WHEN ? = '学习' THEN learning_topic ELSE '' END
+                    WHERE lower(title) LIKE ?
+                      AND category IN ('其他', '聊天', '社交', '网站', '浏览器', '工具', '打字')
+                    """,
+                    (category, category, like),
+                )
 
     def _ensure_default_goals(self) -> None:
         goals = [
@@ -1400,7 +1500,11 @@ class Storage:
         title_l = (title or "").lower()
         combined = f"{exe} {domain_l} {title_l}"
         best: tuple[int, int, str, str, str, str] | None = None
-        source_priority = {"user": 3000, "default": 2000, "online": 1000}
+        source_priority = {"user": 1600, "default": 420, "online": 160}
+        protected = {
+            (pattern.lower(), category, target)
+            for pattern, category, target in PROTECTED_DEFAULT_CATEGORY_RULES
+        }
         for row in self.category_rules():
             pattern = str(row["pattern"]).lower()
             target = str(row["target"])
@@ -1408,15 +1512,17 @@ class Storage:
             source = str(row["source"] or "user")
             score = 0
             if target in {"any", "title"} and title_l and pattern in title_l:
-                score = max(score, 400 + len(pattern))
+                score = max(score, 5200 + len(pattern) * 12)
             if target in {"any", "domain"} and domain_l and pattern in domain_l:
-                score = max(score, 300 + len(pattern))
+                score = max(score, 5000 + len(pattern) * 14)
             if target in {"any", "app"} and exe and pattern in exe:
-                score = max(score, 250 + len(pattern))
+                score = max(score, 4700 + len(pattern) * 12)
             if target == "any" and score == 0 and pattern in combined:
-                score = 100 + len(pattern)
+                score = 1500 + len(pattern) * 8
             if score > 0:
-                score += source_priority.get(source, 2500)
+                score += source_priority.get(source, 300)
+                if source != "user" and (pattern, category, target) in protected:
+                    score += 1000
             if score > 0 and (best is None or score > best[0]):
                 best = (score, len(pattern), category, target, pattern, source)
         return best
@@ -1530,6 +1636,7 @@ class Storage:
             BROAD_PLATFORM_CATEGORIES,
             clean_lookup_title,
             is_generic_content_domain,
+            looks_like_video_content,
             normalize_lookup_text,
         )
 
@@ -1560,6 +1667,15 @@ class Storage:
             title = clean_lookup_title(domain, str(row["content_title"] or ""))
             local_match = self._category_rule_match(exe_name, domain, title)
             local = local_match[2] if local_match else "其他"
+            if (
+                current == "视频"
+                and str(row["kind"] or "") == "web_page"
+                and is_generic_content_domain(domain)
+                and not looks_like_video_content(domain, title, str(row["content_url"] or ""))
+            ):
+                updates.append(("网站", str(row["usage_date"]), str(row["kind"]), str(row["exe_path"]), str(row["content_key"])))
+                stats["local_updated"] += 1
+                continue
             strong_local_tool = bool(
                 local_match
                 and local == "工具"

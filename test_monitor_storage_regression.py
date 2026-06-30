@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
+import usage_widget.monitor as monitor_module
+from usage_widget.media import MediaItem
 from usage_widget.monitor import ProcessMonitor
 from usage_widget.storage import Storage
 
@@ -13,6 +16,36 @@ class BrokenBridge:
 
     def latest(self):
         raise RuntimeError("latest bridge failed")
+
+
+class FakeProc:
+    def __init__(self, pid: int, name: str, exe_path: str) -> None:
+        self.info = {"pid": pid, "name": name}
+        self._exe_path = exe_path
+
+    def exe(self) -> str:
+        return self._exe_path
+
+
+class FakeBridge:
+    def __init__(self, latest_tab) -> None:
+        self.latest_tab = latest_tab
+
+    def audible_tabs(self) -> list:
+        return []
+
+    def latest(self, max_age_seconds: float = 10.0):
+        return self.latest_tab
+
+
+class FakeMediaProvider:
+    consecutive_errors = 0
+
+    def refresh_sync(self, timeout_seconds: float = 0.8) -> list[MediaItem]:
+        return [MediaItem(source="chrome.exe", title="Song A", artist="Artist A", is_playing=True)]
+
+    def current_items(self) -> list[MediaItem]:
+        return []
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -75,6 +108,68 @@ def main() -> None:
             ("C:/Chrome/chrome.exe",),
         ).fetchone()
         check("running seconds are stored once per grouped process", float(row["running_seconds"]) == 10.0, repr(dict(row)))
+
+        typing_title = "在线打字练习"
+        typing_tab = SimpleNamespace(
+            title=typing_title,
+            url="https://dazidazi.com",
+            domain="dazidazi.com",
+            h1="",
+            description="",
+            muted=False,
+            has_video=True,
+            has_audio=True,
+            media_state="playing",
+        )
+        original_process_iter = monitor_module.psutil.process_iter
+        original_foreground_window_info = monitor_module.foreground_window_info
+        original_idle_seconds = monitor_module.idle_seconds
+        try:
+            monitor_module.psutil.process_iter = lambda _attrs: [
+                FakeProc(10, "Code.exe", "C:/Apps/Code.exe"),
+                FakeProc(20, "chrome.exe", "C:/Apps/chrome.exe"),
+            ]
+            monitor_module.foreground_window_info = lambda: SimpleNamespace(pid=10, title="notes")
+            monitor_module.idle_seconds = lambda: 0.0
+            monitor.browser_bridge = FakeBridge(typing_tab)  # type: ignore[assignment]
+            monitor.media_provider = FakeMediaProvider()  # type: ignore[assignment]
+            monitor._last_sample = datetime.now() - timedelta(seconds=5)
+            monitor.sample(write=True)
+            content_row = storage.conn.execute(
+                """
+                SELECT kind, content_title, content_domain, category
+                FROM content_usage_daily
+                WHERE attention_seconds > 0
+                ORDER BY rowid DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            check("non-browser foreground does not borrow stale browser tab", content_row["kind"] == "window_title", repr(dict(content_row)))
+            check("non-browser foreground keeps own title", content_row["content_title"] == "notes", repr(dict(content_row)))
+            check("non-browser foreground is not typing category", content_row["category"] != "打字", repr(dict(content_row)))
+
+            storage.conn.execute("DELETE FROM content_usage_daily")
+            storage.conn.execute("DELETE FROM timeline_events")
+            storage.conn.commit()
+            monitor_module.foreground_window_info = lambda: SimpleNamespace(pid=20, title=f"{typing_title} - Google Chrome")
+            monitor._last_sample = datetime.now() - timedelta(seconds=5)
+            monitor.sample(write=True)
+            fg_row = storage.conn.execute(
+                """
+                SELECT kind, content_title, content_domain, category
+                FROM content_usage_daily
+                WHERE attention_seconds > 0
+                ORDER BY rowid DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            check("browser foreground uses active typing tab", fg_row["kind"] == "web_page", repr(dict(fg_row)))
+            check("browser foreground typing domain is preserved", fg_row["content_domain"] == "dazidazi.com", repr(dict(fg_row)))
+            check("browser foreground typing category is typing", fg_row["category"] == "打字", repr(dict(fg_row)))
+        finally:
+            monitor_module.psutil.process_iter = original_process_iter
+            monitor_module.foreground_window_info = original_foreground_window_info
+            monitor_module.idle_seconds = original_idle_seconds
     finally:
         storage.close()
         for suffix in ("", "-shm", "-wal"):

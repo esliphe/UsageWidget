@@ -76,7 +76,7 @@ def source_label(value: str) -> str:
 def short_activity_hint(exe_name: str = "", domain: str = "", title: str = "", category: str = "") -> str:
     text = " ".join((exe_name, domain, title, category)).casefold()
     hints = [
-        (("dazidazi.com", "dazidazi", "monkeytype", "10fastfingers", "typing", "type practice", "打字", "键盘练习"), "打字"),
+        (("dazidazi.com", "dazidazi", "monkeytype", "10fastfingers", "keybr.com", "typing.com", "typingclub.com", "typing", "type practice", "打字", "键盘练习"), "打字"),
         (("codex", "chatgpt", "openai", "claude", "deepseek", "kimi", "doubao"), "AI助手"),
         (("figma", "canva", "photoshop", "illustrator", "sketch"), "设计"),
         (("excalidraw", "draw.io", "diagram", "流程图"), "绘图"),
@@ -91,7 +91,7 @@ def short_activity_hint(exe_name: str = "", domain: str = "", title: str = "", c
     for keys, label in hints:
         if any(key in text for key in keys):
             return label
-    if category in {"学习", "编程", "游戏", "音乐", "娱乐", "购物", "新闻", "聊天", "办公"}:
+    if category in {"学习", "编程", "游戏", "音乐", "娱乐", "购物", "新闻", "聊天", "办公", "打字"}:
         return category
     return ""
 

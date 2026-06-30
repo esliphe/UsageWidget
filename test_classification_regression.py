@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
@@ -246,8 +247,12 @@ def main() -> int:
             ("browser", "bilibili.com", "搞笑合集 笑到肚子疼", "娱乐"),
             ("browser", "bilibili.com", "手机开箱测评 好物推荐", "购物"),
             ("browser", "bilibili.com", "今日热点 新闻资讯", "新闻"),
+            ("browser", "bilibili.com", "哔哩哔哩 首页", "网站"),
             ("Codex.exe", "", "Codex", "AI 工具"),
-            ("browser", "dazidazi.com", "在线打字练习", "工具"),
+            ("browser", "chat.deepseek.com", "DeepSeek", "AI 工具"),
+            ("browser", "www.deepseek.com", "DeepSeek 官方网站", "AI 工具"),
+            ("browser", "dazidazi.com", "在线打字练习", "打字"),
+            ("browser", "monkeytype.com", "English typing practice", "打字"),
             ("browser", "music.163.com", "周杰伦 歌单", "音乐"),
             ("yuanbao.exe", "", "腾讯元宝", "AI 工具"),
             ("stm32cubemx.exe", "", "Pinout Configuration", "编程"),
@@ -255,6 +260,55 @@ def main() -> int:
         for exe, domain, title, expected in cases:
             actual = monitor._fallback_category_for(exe, domain, title)
             check(f"{title[:24]} -> {expected}", actual == expected, f"got {actual}")
+        check(
+            "Bilibili search url is not video category",
+            monitor._category_for("browser", "bilibili.com", "搜索 Python", settings, url="https://search.bilibili.com/all?keyword=python") != "视频",
+        )
+        check(
+            "Bilibili playback url may remain video category",
+            monitor._category_for("browser", "bilibili.com", "电影 正片 视频播放", settings, url="https://www.bilibili.com/video/BV123") == "视频",
+        )
+        check(
+            "typing page is explicit typing category",
+            monitor._category_for("browser", "dazidazi.com", "在线打字练习", settings, url="https://dazidazi.com/") == "打字",
+        )
+        search_tab = SimpleNamespace(
+            domain="bilibili.com",
+            url="https://search.bilibili.com/all?keyword=python",
+            title="搜索 Python",
+            h1="搜索 Python",
+            description="",
+            muted=False,
+            has_video=False,
+            has_audio=True,
+            media_state="none",
+        )
+        check("audible search page is media, not video", monitor._browser_playback_kind(search_tab) == "media_playback")
+        typing_tab = SimpleNamespace(
+            domain="dazidazi.com",
+            url="https://dazidazi.com/",
+            title="在线打字练习",
+            h1="在线打字练习",
+            description="",
+            muted=False,
+            has_video=False,
+            has_audio=False,
+            media_state="none",
+        )
+        check("typing page is web activity, not media", monitor._browser_playback_kind(typing_tab) == "web_page")
+        check("typing page has no browser media signal", not monitor._browser_tab_has_media_signal(typing_tab))
+        playing_tab = SimpleNamespace(
+            domain="bilibili.com",
+            url="https://www.bilibili.com/video/BV123",
+            title="Python 教程",
+            h1="Python 教程",
+            description="",
+            muted=False,
+            has_video=True,
+            has_audio=True,
+            media_state="playing",
+        )
+        check("video page with element is video playback", monitor._browser_playback_kind(playing_tab) == "video_playback")
     finally:
         storage.close()
         temp_dir.cleanup()
@@ -277,6 +331,19 @@ def main() -> int:
                     "learning_topic": "",
                     "attention_seconds": 0,
                     "background_seconds": 1800,
+                },
+                {
+                    "kind": "web_page",
+                    "exe_name": "browser",
+                    "exe_path": "browser",
+                    "content_key": "web:bilibili-search",
+                    "content_title": "搜索 Python",
+                    "content_url": "https://search.bilibili.com/all?keyword=python",
+                    "content_domain": "bilibili.com",
+                    "category": "视频",
+                    "learning_topic": "",
+                    "attention_seconds": 120,
+                    "background_seconds": 0,
                 },
                 {
                     "kind": "web_page",
@@ -312,10 +379,14 @@ def main() -> int:
             "SELECT category FROM content_usage_daily WHERE content_key = 'video:bilibili-genshin'"
         ).fetchone()
         check("local repair refines bilibili video", game_row["category"] == "游戏", str(stats))
+        search_row = storage.conn.execute(
+            "SELECT category FROM content_usage_daily WHERE content_key = 'web:bilibili-search'"
+        ).fetchone()
+        check("local repair demotes generic web video mislabel", search_row["category"] == "网站", str(stats))
         typing_row = storage.conn.execute(
             "SELECT category FROM content_usage_daily WHERE content_key = 'web:dazidazi'"
         ).fetchone()
-        check("local repair marks known typing site as tool", typing_row["category"] == "工具", str(stats))
+        check("local repair marks known typing site as typing", typing_row["category"] == "打字", str(stats))
 
         old_lookup_sync = OnlineCategoryClassifier.lookup_sync
 

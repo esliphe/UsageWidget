@@ -26,6 +26,56 @@ GENERIC_CONTENT_DOMAINS = {
 BROAD_PLATFORM_CATEGORIES = {"视频", "娱乐", "社交", "网站", "浏览器"}
 
 
+KNOWN_VIDEO_DOMAINS = {
+    "bilibili.com",
+    "b23.tv",
+    "youtube.com",
+    "youtu.be",
+    "youku.com",
+    "iqiyi.com",
+    "v.qq.com",
+    "mgtv.com",
+    "douyin.com",
+    "kuaishou.com",
+}
+
+
+_VIDEO_TITLE_HINTS = (
+    "video",
+    "movie",
+    "episode",
+    "streaming",
+    "livestream",
+    "live stream",
+    "watch",
+    "视频",
+    "播放",
+    "直播",
+    "电影",
+    "电视剧",
+    "剧集",
+    "番剧",
+    "纪录片",
+    "影视",
+    "在线观看",
+)
+
+
+_VIDEO_URL_HINTS = (
+    "/watch?",
+    "/watch/",
+    "/shorts/",
+    "/embed/",
+    "/video/",
+    "/live/",
+    "/bangumi/play/",
+    "/medialist/play/",
+    "/x/cover/",
+    "/cover/",
+    "/v_",
+)
+
+
 _BROWSER_TITLE_SUFFIXES = (
     " - Google Chrome",
     " - Microsoft Edge",
@@ -72,6 +122,41 @@ def is_generic_content_domain(domain: str) -> bool:
     if not domain_l:
         return False
     return any(domain_l == item or domain_l.endswith("." + item) for item in GENERIC_CONTENT_DOMAINS)
+
+
+def is_known_video_domain(domain: str) -> bool:
+    domain_l = (domain or "").casefold().strip()
+    if not domain_l:
+        return False
+    return any(domain_l == item or domain_l.endswith("." + item) for item in KNOWN_VIDEO_DOMAINS)
+
+
+def _hint_matches(text_l: str, hint_l: str) -> bool:
+    if not hint_l:
+        return False
+    if re.fullmatch(r"[a-z0-9]+", hint_l) and len(hint_l) <= 5:
+        return re.search(rf"(?<![a-z0-9]){re.escape(hint_l)}(?![a-z0-9])", text_l) is not None
+    return hint_l in text_l
+
+
+def looks_like_video_content(domain: str, title: str = "", url: str = "") -> bool:
+    title_l = clean_lookup_title(domain, title).casefold()
+    if title_l and any(_hint_matches(title_l, hint.casefold()) for hint in _VIDEO_TITLE_HINTS):
+        return True
+    url_l = (url or "").casefold().strip()
+    if not url_l:
+        return False
+    if any(hint in url_l for hint in _VIDEO_URL_HINTS):
+        return True
+    if is_known_video_domain(domain):
+        if re.search(r"/(?:bv|av)[a-z0-9]+(?:[/?#]|$)", url_l, flags=re.I):
+            return True
+        if re.search(r"\.html(?:[?#]|$)", url_l) and not any(
+            marker in url_l
+            for marker in ("/search", "/space/", "/channel/", "/account/", "/settings", "/feed/")
+        ):
+            return True
+    return False
 
 
 def clean_lookup_title(domain: str, title: str) -> str:

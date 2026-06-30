@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import traceback
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from . import __app_name__, __version__
@@ -23,8 +24,20 @@ def main() -> int:
         storage = Storage()
         monitor = ProcessMonitor(storage)
         window = UsageWidgetWindow(storage, monitor)
+
+        def start_monitor() -> None:
+            try:
+                monitor.start()
+            except Exception as exc:
+                log_event("启动监控失败：\n" + traceback.format_exc())
+                QMessageBox.critical(
+                    window,
+                    "UsageWidget 监控启动失败",
+                    f"程序界面已打开，但监控启动失败：\n{exc}\n\n诊断日志：\n{log_path()}",
+                )
+
         window.show()
-        monitor.start()
+        QTimer.singleShot(250, start_monitor)
     except Exception as exc:
         log_event("启动失败：\n" + traceback.format_exc())
         QMessageBox.critical(
