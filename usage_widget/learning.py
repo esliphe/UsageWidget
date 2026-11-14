@@ -1,21 +1,24 @@
 from __future__ import annotations
 
-import json
 import re
 import threading
 import time
 import urllib.parse
-import urllib.request
 import html as html_lib
 from collections import deque
 from dataclasses import dataclass
 
+from .netlookup import (
+    DESKTOP_USER_AGENT,
+    USER_AGENT,
+    fetch_json,
+    fetch_text,
+    is_access_challenge,
+)
 from .classification import clean_lookup_title
 from .online_category import ProviderResponseError
 
 
-USER_AGENT = "UsageWidget"
-DESKTOP_USER_AGENT = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) {USER_AGENT}"
 
 LEARNING_INTENT_HINTS = {
     "course",
@@ -608,31 +611,13 @@ class OnlineLearningTopicClassifier:
                 return LearningTopicResult(alt.topic, max(alt.confidence, 0.55), f"wiki-{lang}", summary[:300])
         return LearningTopicResult("", 0.0, f"wiki-{lang}", summary[:300])
 
-    @staticmethod
-    def _is_access_challenge(text: str) -> bool:
-        normalized = (text or "").casefold()
-        return any(marker in normalized for marker in (
-            "百度安全验证", "安全验证", "请输入验证码", "verify you are human",
-            "captcha", "unusual traffic", "cf-chl-",
-        ))
+    _is_access_challenge = staticmethod(is_access_challenge)
 
     def _fetch_json(self, url: str) -> dict:
-        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(request, timeout=3.0) as response:
-            raw = response.read(256 * 1024)
-        return json.loads(raw.decode("utf-8", errors="replace"))
+        return fetch_json(url, timeout=3.0)
 
     def _fetch_text(self, url: str) -> str:
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": DESKTOP_USER_AGENT,
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=4.0) as response:
-            raw = response.read(256 * 1024)
-        return raw.decode("utf-8", errors="replace")
+        return fetch_text(url, timeout=4.0)
 
     def _key(self, domain: str, title: str, description: str) -> str:
         return normalize_text(domain.casefold(), title.casefold(), description.casefold())[:320]

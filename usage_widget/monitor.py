@@ -11,6 +11,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from .browser_bridge import BrowserBridge
 from .classification import (
     BROAD_PLATFORM_CATEGORIES,
+    TYPING_CONTEXT_HINTS,
     clean_lookup_title,
     is_generic_content_domain,
     looks_like_video_content,
@@ -187,23 +188,7 @@ class ProcessMonitor(QObject):
 
     def _is_typing_context(self, domain: str = "", title: str = "", url: str = "") -> bool:
         text = " ".join((domain or "", title or "", url or "")).casefold()
-        typing_hints = (
-            "dazidazi",
-            "monkeytype",
-            "10fastfingers",
-            "keybr.com",
-            "typing.com",
-            "typingclub.com",
-            "typing practice",
-            "type practice",
-            "keyboard practice",
-            "words per minute",
-            "wpm",
-            "打字",
-            "打字练习",
-            "键盘练习",
-        )
-        return any(item in text for item in typing_hints)
+        return any(item in text for item in TYPING_CONTEXT_HINTS)
 
     def _is_generic_content_domain(self, domain: str) -> bool:
         return is_generic_content_domain(domain)
@@ -377,7 +362,10 @@ class ProcessMonitor(QObject):
         except Exception:
             from .diagnostics import log_event
             import traceback
-            log_event(f"学习主题识别异常: category={category} domain={domain} title={str(title)[:80]} kind={kind}: {traceback.format_exc()}")
+            log_event(
+                f"学习主题识别异常: category={category} domain={domain} "
+                f"title_len={len(str(title))} kind={kind}: {traceback.format_exc()}"
+            )
             return ""
 
     def _learning_topic_for_impl(
@@ -426,7 +414,7 @@ class ProcessMonitor(QObject):
         except Exception as exc:
             log_event(
                 f"学习分类判定失败: {type(exc).__name__}: category={category} topic={learning_topic} "
-                f"domain={domain} title={str(title)[:80]} kind={kind}: {exc}"
+                f"domain={domain} title_len={len(str(title))} kind={kind}: {exc}"
             )
         return category
 
@@ -1144,12 +1132,17 @@ class ProcessMonitor(QObject):
         self.max_sample_ms = max(self.max_sample_ms, self.last_sample_ms)
         if self.last_sample_ms >= 900 or self.last_db_write_ms >= 350 or self.last_process_scan_ms >= 650:
             self.slow_sample_count += 1
+            # Diagnose slow samples without persisting window titles: the log is
+            # plain text on disk, so only the executable name and the title
+            # length are recorded here.
+            foreground_app = Path(self.foreground_path).name if self.foreground_path else ""
             log_event(
                 "慢采样 "
                 f"total={self.last_sample_ms:.0f}ms "
                 f"scan={self.last_process_scan_ms:.0f}ms "
                 f"db={self.last_db_write_ms:.0f}ms "
                 f"processes={len(groups)} "
-                f"foreground={self.foreground_title[:80]}"
+                f"foreground={foreground_app} "
+                f"title_len={len(self.foreground_title)}"
             )
         self.updated.emit()

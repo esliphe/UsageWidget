@@ -1163,14 +1163,16 @@ class SettingsDialog(QDialog):
                 names.append(item.text())
         return names
 
-    def _run_file_action(self, success_title: str, success_text: str, action) -> None:
+    def _run_file_action(self, success_title: str, success_text, action) -> None:
         try:
-            action()
+            result = action()
         except Exception as exc:
             show_operation_error(self, success_title.replace("完成", "失败"), exc)
             return
         self._refresh_database_status()
-        QMessageBox.information(self, success_title, success_text)
+        if callable(success_text):
+            success_text = success_text(result)
+        QMessageBox.information(self, success_title, str(success_text))
 
     def _refresh_database_status(self) -> None:
         if not hasattr(self, "database_status_label"):
@@ -1239,7 +1241,15 @@ class SettingsDialog(QDialog):
         self._run_file_action("备份完成", f"已备份到：\n{path}", lambda: self.storage.backup_database(Path(path)))
 
     def optimize_database(self) -> None:
-        self._run_file_action("优化完成", "数据库索引统计和 WAL 检查点已更新。", self.storage.optimize_database)
+        def describe(result) -> str:
+            before, after = result
+            saved = max(0, int(before) - int(after))
+            return (
+                f"数据库已压缩重建：{before / 1024 / 1024:.1f} MB → {after / 1024 / 1024:.1f} MB\n"
+                f"实际回收 {saved / 1024 / 1024:.1f} MB，索引统计与 WAL 已同步更新。"
+            )
+
+        self._run_file_action("优化完成", describe, self.storage.optimize_database)
 
     def cleanup_timeline(self) -> None:
         retention_days = self.retention_spin.value()

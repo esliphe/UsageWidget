@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
+from .classification import TYPING_DOMAINS, TYPING_TITLE_HINTS
 from .diagnostics import log_event
 from .media import parse_music_identity
 
@@ -452,15 +453,8 @@ DEFAULT_CATEGORY_RULES += [
     ("slack.com", "聊天", "domain"),
     ("messages.google.com", "聊天", "domain"),
     ("whatsapp.com", "聊天", "domain"),
-    ("dazidazi.com", "打字", "domain"),
-    ("monkeytype.com", "打字", "domain"),
-    ("10fastfingers.com", "打字", "domain"),
-    ("keybr.com", "打字", "domain"),
-    ("typing.com", "打字", "domain"),
-    ("typingclub.com", "打字", "domain"),
-    ("dazidazi", "打字", "title"),
-    ("打字", "打字", "title"),
-    ("typing", "打字", "title"),
+    *[(domain, "打字", "domain") for domain in TYPING_DOMAINS],
+    *[(hint, "打字", "title") for hint in TYPING_TITLE_HINTS],
     ("zhihu.com", "学习", "domain"),
     ("csdn.net", "编程", "domain"),
     ("cnblogs.com", "编程", "domain"),
@@ -509,6 +503,11 @@ DEFAULT_CATEGORY_RULES += [
     ("资讯", "新闻", "title"),
 ]
 
+# This table is hand-maintained and had accumulated exact duplicates from
+# copy-paste edits. Keeping the first occurrence removes them without changing
+# precedence or the seeded rows (identical triples upsert to the same values).
+DEFAULT_CATEGORY_RULES = list(dict.fromkeys(DEFAULT_CATEGORY_RULES))
+
 PROTECTED_DEFAULT_CATEGORY_RULES = [
     ("chatgpt.com", "AI 工具", "domain"),
     ("claude.ai", "AI 工具", "domain"),
@@ -525,15 +524,6 @@ PROTECTED_DEFAULT_CATEGORY_RULES = [
     ("kimi", "AI 工具", "title"),
     ("豆包", "AI 工具", "title"),
     ("腾讯元宝", "AI 工具", "title"),
-    ("dazidazi.com", "打字", "domain"),
-    ("monkeytype.com", "打字", "domain"),
-    ("10fastfingers.com", "打字", "domain"),
-    ("keybr.com", "打字", "domain"),
-    ("typing.com", "打字", "domain"),
-    ("typingclub.com", "打字", "domain"),
-    ("dazidazi", "打字", "title"),
-    ("打字", "打字", "title"),
-    ("typing", "打字", "title"),
 ]
 
 
@@ -575,6 +565,9 @@ def app_data_dir() -> Path:
 
 
 class Storage:
+    #: Bumped whenever the schema changes in a way migrations must know about.
+    SCHEMA_VERSION = 1
+
     def __init__(self, db_path: Path | None = None) -> None:
         requested_path = Path(db_path) if db_path else app_data_dir() / "usage.db"
         self.db_path = requested_path
@@ -603,6 +596,26 @@ class Storage:
         self._init_schema()
         self._migrate_schema()
         self._ensure_defaults()
+        self._stamp_schema_version()
+
+    def _stamp_schema_version(self) -> None:
+        """Record the schema revision in PRAGMA user_version.
+
+        Earlier builds brought the schema up to date by probing columns one at
+        a time and never stamped a version, so a fresh database and a migrated
+        one looked identical. Stamping it now gives future migrations a cheap
+        precondition instead of another round of table_info probing.
+        """
+        current = int(self.conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+        if current > self.SCHEMA_VERSION:
+            log_event(
+                f"数据库架构版本 {current} 高于本程序支持的 {self.SCHEMA_VERSION}，"
+                "可能存在未知字段或行为差异"
+            )
+            return
+        if current != self.SCHEMA_VERSION:
+            self.conn.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
+            self.conn.commit()
 
     def _recover_readonly_database(self, original_path: Path, error: Exception) -> None:
         try:
@@ -1015,10 +1028,8 @@ class Storage:
                 ("聊天", "weixin.exe", "app", "社交"),
                 ("娱乐", "douyin.com", "domain", "视频"),
                 ("娱乐", "weibo.com", "domain", "社交"),
-                ("打字", "dazidazi.com", "domain", "工具"),
-                ("打字", "dazidazi", "title", "工具"),
-                ("打字", "打字", "title", "工具"),
-                ("打字", "typing", "title", "工具"),
+                *[("打字", domain, "domain", "工具") for domain in TYPING_DOMAINS],
+                *[("打字", hint, "title", "工具") for hint in TYPING_TITLE_HINTS],
             ],
         )
         self.conn.executemany(
@@ -1740,7 +1751,7 @@ class Storage:
                         result = classifier.lookup_sync(exe_name, domain, title)
                         online_cache[cache_key] = result
                 except Exception as exc:
-                    log_event(f"历史内容联网分类失败: domain={domain} title={title[:80]} error={exc}")
+                    log_event(f"历史内容联网分类失败: domain={domain} title_len={len(title)} error={exc}")
                     continue
                 if (
                     result.category
@@ -2995,10 +3006,43 @@ class Storage:
         self.conn.commit()
         shutil.copy2(self.db_path, output_path)
 
-    def optimize_database(self) -> None:
+    def optimize_database(self) -> tuple[int, int]:
+        """Compact the database file and refresh index statistics.
+
+        Returns ``(bytes_before, bytes_after)`` so the caller can report how
+        much space was actually reclaimed.
+
+        Deleting rows never shrinks a SQLite file on its own: the freed pages
+        stay on the freelist until the file is rewritten. Only ``VACUUM`` does
+        that, and this method used to skip it -- which is why "优化数据库"
+        reported success while the file stayed exactly the same size.
+        """
         self.conn.commit()
+        before = self.database_size_bytes()
         self.conn.execute("PRAGMA optimize")
-        self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        self._checkpoint(truncate=True)
+        try:
+            self.conn.execute("VACUUM")
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" in message or "busy" in message:
+                raise RuntimeError(
+                    "数据库正被其他操作占用，暂时无法压缩。请暂停记录后重试。"
+                ) from exc
+            raise
+        self._checkpoint(truncate=True)
+        return before, self.database_size_bytes()
+
+    def _checkpoint(self, truncate: bool = False) -> None:
+        """Checkpoint the WAL, falling back to PASSIVE when readers are active."""
+        mode = "TRUNCATE" if truncate else "PASSIVE"
+        try:
+            self.conn.execute(f"PRAGMA wal_checkpoint({mode})")
+        except sqlite3.OperationalError:
+            if truncate:
+                self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            else:
+                raise
 
     def database_size_bytes(self) -> int:
         total = 0

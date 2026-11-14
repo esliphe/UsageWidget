@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 import urllib.error
@@ -19,12 +18,10 @@ MUSICBRAINZ_USER_AGENT = f"{USER_AGENT} (local personal usage analytics)"
 API_TIMEOUTS = {
     "itunes": 1.5,
     "musicbrainz": 3.0,
-    "lastfm": 2.5,
 }
 API_RETRIES = {
     "itunes": 1,
     "musicbrainz": 2,
-    "lastfm": 1,
 }
 
 
@@ -44,11 +41,9 @@ class OnlineMusicVerifier:
         self,
         min_interval: float = 8.0,
         ttl_seconds: float = 86400.0,
-        lastfm_api_key: str | None = None,
     ) -> None:
         self.min_interval = min_interval
         self.ttl_seconds = ttl_seconds
-        self.lastfm_api_key = (lastfm_api_key or os.getenv("USAGEWIDGET_LASTFM_API_KEY", "")).strip()
         self.error_ttl_seconds = 600.0
         self.max_workers = 5
         self.max_pending = 80
@@ -155,10 +150,6 @@ class OnlineMusicVerifier:
         result = self._lookup_musicbrainz(query, song, artist)
         if result.is_music:
             return result
-        # Try Last.fm as final fallback
-        result = self._lookup_lastfm(query, song, artist)
-        if result.is_music:
-            return result
         return MusicLookupResult(False, 0.0, "multi")
 
     def _lookup_itunes(self, query: str, song: str, artist: str) -> MusicLookupResult:
@@ -194,36 +185,6 @@ class OnlineMusicVerifier:
             if score >= 80 and self._matches(song, artist, track, artist_name):
                 return MusicLookupResult(True, min(0.98, score / 100.0), "musicbrainz", track, artist_name)
         return MusicLookupResult(False, 0.0, "musicbrainz")
-
-    def _lookup_lastfm(self, query: str, song: str, artist: str) -> MusicLookupResult:
-        """Query Last.fm search API as a fallback music verification source."""
-        if not self.lastfm_api_key:
-            return MusicLookupResult(False, 0.0, "lastfm-disabled")
-        params = urllib.parse.urlencode({
-            "method": "track.search",
-            "track": query,
-            "api_key": self.lastfm_api_key,
-            "format": "json",
-            "limit": "5",
-        })
-        try:
-            data = self._fetch_json(
-                f"https://ws.audioscrobbler.com/2.0/?{params}",
-                headers={"User-Agent": USER_AGENT},
-                timeout=API_TIMEOUTS["lastfm"],
-                retries=API_RETRIES["lastfm"],
-            )
-            tracks = data.get("results", {}).get("trackmatches", {}).get("track", [])
-            if not isinstance(tracks, list):
-                tracks = [tracks] if tracks else []
-            for item in tracks[:5]:
-                track = str(item.get("name", "")).strip()
-                artist_name = str(item.get("artist", "")).strip()
-                if self._matches(song, artist, track, artist_name):
-                    return MusicLookupResult(True, 0.85, "lastfm", track, artist_name)
-        except Exception:
-            pass
-        return MusicLookupResult(False, 0.0, "lastfm")
 
     def _fetch_json(self, url: str, headers: dict[str, str], *, timeout: float = 3.0, retries: int = 0) -> dict:
         last_error: Exception | None = None

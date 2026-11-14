@@ -2,13 +2,22 @@
 
 UsageWidget 是一款 Windows 本地时间记录与使用分析桌面小组件，支持进程运行、前台注视、网页浏览、视频播放、音乐播放和学习内容统计，并提供分类汇总、学习主题识别、24 小时视图、热力图、目标复盘、CSV/HTML 报告导出和隐私模式。
 
-当前稳定版本：`v5.45.13-stable`
+当前稳定版本：`v5.45.14-stable`
+- 修复“优化数据库”不回收空间的问题：此前只刷新索引统计和 WAL 检查点、不执行 VACUUM，清理旧时间线后文件大小不变；现在会重建数据库并回报实际回收的体积。
+- 诊断日志不再写入前台窗口标题，只记录进程名与标题长度，避免明文日志泄漏浏览内容。
+- 分类规则的站点知识收敛为单一来源，默认规则由共享常量生成；新增打字站点只需改一处，不再同时修改存储层和监控层。
+- 移除无密钥时恒不可用的 Last.fm 音乐校验分支；iTunes / MusicBrainz 校验链路保持不变。
+- 联网查询的抓取、UA 与验证码识别抽为共用模块，学习主题与联网分类不再各自维护一份实现；百度页面的 GB18030 编码现在能正确解码。
+- 数据库首次写入 `PRAGMA user_version` 架构版本号，为后续迁移提供前置判断。
+- 新增 `run_tests.py` 统一回归入口与 `scripts/build_release.py` 打包脚本：构建后校验可执行文件、运行时文件与随包字体，生成 SHA256 清单，避免再次产出空包。
+
+上一稳定版本：`v5.45.13-stable`
 - 联网分类与学习主题识别会拒绝验证码/安全验证页面；不可达服务进入短暂冷却，避免连续查询重复等待超时。
 - 联网分类、学习主题和音乐校验改为有界 FIFO 队列，任务高峰时不再静默丢弃；仅真实外部来源可写入“联网分类”规则。
 - 深色主题下的小组件空状态、统计图零数据状态和状态表焦点显示得到修复；时间线在最小窗口宽度下不再横向滚动。
 - 学习目标界面只显示用户可理解的中文指标名，不再暴露内部字段标识。
 
-上一稳定版本：`v5.45.12-stable`
+更早稳定版本：`v5.45.12-stable`
 - 优化网页、视频和音乐的优先级：打字练习网页会优先识别为“打字”，普通网页不再因为浏览器媒体会话被误当成播放内容。
 - 折叠栏在“活动中”后新增短状态胶囊，可显示打字、网页、音乐、视频等当前状态；前台打字/网页优先于后台音乐展示。
 - 改进悬浮窗收回体验：离开后更快收回，收回动画缩短到 95ms，展开动画 150ms，并预先按目标尺寸校准位置，减少卡顿和边缘跳动。
@@ -146,22 +155,36 @@ dist\UsageWidget\UsageWidget.exe
 
 ```text
 .
-├── run.py
+├── run.py                      # 程序入口
+├── run_tests.py                # 统一回归入口（python run_tests.py）
 ├── requirements.txt
-├── UsageWidget.spec
-├── browser-extension
+├── UsageWidget.spec            # PyInstaller 打包配置
+├── scripts
+│   └── build_release.py        # 构建 + 校验 + SHA256 + 打包
+├── fonts                       # 随包中文字体（构建必需）
+├── browser-extension           # Chromium MV3 扩展
+├── test_*.py                   # 回归脚本
 └── usage_widget
-    ├── main.py
-    ├── ui.py
-    ├── monitor.py
-    ├── storage.py
-    ├── learning.py
-    ├── online_category.py
-    ├── media.py
-    ├── browser_bridge.py
-    ├── content.py
-    ├── diagnostics.py
-    └── startup.py
+    ├── main.py                 # 应用启动
+    ├── ui.py                   # 主窗口与对话框
+    ├── ui_widgets.py           # 自绘图表控件
+    ├── ui_helpers.py           # 界面文案与状态辅助
+    ├── ui_palette.py           # 跨图表配色
+    ├── monitor.py              # 采样与监控
+    ├── storage.py              # SQLite 数据层
+    ├── classification.py       # 分类规则与站点常量
+    ├── learning.py             # 学习主题识别
+    ├── online_category.py      # 联网分类增强
+    ├── netlookup.py            # 联网抓取共用实现
+    ├── music_lookup.py         # 音乐校验
+    ├── media.py                # 媒体会话读取
+    ├── browser_bridge.py       # 浏览器扩展本地桥接
+    ├── content.py              # 内容记录辅助
+    ├── native_window.py        # 前台窗口读取
+    ├── idle.py                 # 键鼠空闲检测
+    ├── timefmt.py              # 时长格式化
+    ├── diagnostics.py          # 诊断日志
+    └── startup.py              # 开机自启动
 ```
 
 ## 版本说明

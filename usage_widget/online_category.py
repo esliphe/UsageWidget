@@ -1,15 +1,20 @@
 from __future__ import annotations
 
-import json
 import re
 import threading
 import time
 import urllib.parse
-import urllib.request
 import html as html_lib
 from collections import deque
 from dataclasses import dataclass
 
+from .netlookup import (
+    DESKTOP_USER_AGENT,
+    USER_AGENT,
+    fetch_json,
+    fetch_text,
+    is_access_challenge,
+)
 from .classification import (
     BROAD_PLATFORM_CATEGORIES,
     clean_lookup_title,
@@ -18,8 +23,6 @@ from .classification import (
 )
 
 
-USER_AGENT = "UsageWidget"
-DESKTOP_USER_AGENT = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) {USER_AGENT}"
 
 @dataclass(frozen=True)
 class CategoryLookupResult:
@@ -820,13 +823,7 @@ class OnlineCategoryClassifier:
             category, confidence = self._classify_text(domain)
         return CategoryLookupResult(category, confidence, f"wiki-{lang}", summary[:260])
 
-    @staticmethod
-    def _is_access_challenge(text: str) -> bool:
-        normalized = (text or "").casefold()
-        return any(marker in normalized for marker in (
-            "百度安全验证", "安全验证", "请输入验证码", "verify you are human",
-            "captcha", "unusual traffic", "cf-chl-",
-        ))
+    _is_access_challenge = staticmethod(is_access_challenge)
 
     def _query(self, exe_name: str, domain: str, title: str) -> str:
         domain = (domain or "").strip()
@@ -876,33 +873,10 @@ class OnlineCategoryClassifier:
         return hint_l in text_l
 
     def _fetch_json(self, url: str) -> dict:
-        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(request, timeout=2.5) as response:
-            raw = response.read(256 * 1024)
-        data = json.loads(raw.decode("utf-8", errors="replace"))
-        if not isinstance(data, dict):
-            raise ValueError(f"Expected JSON object, got {type(data).__name__}")
-        return data
+        return fetch_json(url, timeout=2.5)
 
     def _fetch_text(self, url: str) -> str:
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": DESKTOP_USER_AGENT,
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=2.5) as response:
-            raw = response.read(256 * 1024)
-            charset = response.headers.get_content_charset() or ""
-        for encoding in (charset, "utf-8", "gb18030"):
-            if not encoding:
-                continue
-            try:
-                return raw.decode(encoding, errors="replace")
-            except LookupError:
-                continue
-        return raw.decode("utf-8", errors="replace")
+        return fetch_text(url, timeout=2.5)
 
     def _key(self, exe_name: str, domain: str, title: str) -> str:
         clean_title = clean_lookup_title(domain, title)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from usage_widget.music_lookup import OnlineMusicVerifier
@@ -17,19 +16,12 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 def main() -> None:
     source = Path("usage_widget/music_lookup.py").read_text(encoding="utf-8")
     leaked_key_fragments = ("2c5389f9", "2935c2ef", "b944a3d3")
-    check("Last.fm key is not hardcoded", not any(fragment in source for fragment in leaked_key_fragments))
+    check("No provider key is hardcoded", not any(fragment in source for fragment in leaked_key_fragments))
+    check("Dead Last.fm branch removed", "lastfm" not in source.lower())
+    check("Music verification needs no api key", "api_key" not in source)
 
-    old_key = os.environ.pop("USAGEWIDGET_LASTFM_API_KEY", None)
-    try:
-        verifier = OnlineMusicVerifier(min_interval=0.0)
-        result = verifier._lookup_lastfm("Bohemian Rhapsody Queen", "Bohemian Rhapsody", "Queen")
-        check("Last.fm disabled without external key", not result.is_music and result.source == "lastfm-disabled", repr(result))
-    finally:
-        if old_key is not None:
-            os.environ["USAGEWIDGET_LASTFM_API_KEY"] = old_key
-
-    configured = OnlineMusicVerifier(min_interval=0.0, lastfm_api_key="test-key")
-    check("Last.fm key can be injected", configured.lastfm_api_key == "test-key")
+    verifier = OnlineMusicVerifier(min_interval=0.0)
+    check("Verifier constructs without external key", verifier.last_source == "")
 
     check("Unknown web page gets domain hint", low_info_web_hint("example.com", "zzz", "网站") == "网页 · example.com")
     check("Unknown title gets fallback hint", low_info_web_hint("", "Untitled random window", "其他").startswith("未识别网页"))

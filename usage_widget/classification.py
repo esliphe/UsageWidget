@@ -40,6 +40,42 @@ KNOWN_VIDEO_DOMAINS = {
 }
 
 
+# Typing-practice sites. These are the single source of truth: the default
+# category rules in storage.py are generated from them, and the monitor's short
+# status pill reads the same tuples. Adding a site here is the only edit needed.
+TYPING_DOMAINS = (
+    "dazidazi.com",
+    "monkeytype.com",
+    "10fastfingers.com",
+    "keybr.com",
+    "typing.com",
+    "typingclub.com",
+)
+
+TYPING_TITLE_HINTS = (
+    "dazidazi",
+    "打字",
+    "typing",
+)
+
+TYPING_CONTEXT_HINTS = (
+    "dazidazi",
+    "monkeytype",
+    "10fastfingers",
+    "keybr.com",
+    "typing.com",
+    "typingclub.com",
+    "typing practice",
+    "type practice",
+    "keyboard practice",
+    "words per minute",
+    "wpm",
+    "打字",
+    "打字练习",
+    "键盘练习",
+)
+
+
 _VIDEO_TITLE_HINTS = (
     "video",
     "movie",
