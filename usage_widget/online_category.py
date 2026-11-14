@@ -7,6 +7,7 @@ import time
 import urllib.parse
 import urllib.request
 import html as html_lib
+from collections import deque
 from dataclasses import dataclass
 
 from .classification import (
@@ -28,8 +29,16 @@ class CategoryLookupResult:
     summary: str = ""
 
 
+class ProviderResponseError(RuntimeError):
+    """A provider returned an access challenge or another unusable response."""
+
+
 class OnlineCategoryClassifier:
     MAX_CACHE_SIZE = 1200
+    PROVIDER_FAILURE_COOLDOWN_SECONDS = 120.0
+    REMOTE_SOURCES = frozenset({
+        "site-meta", "baidu", "duckduckgo", "duckduckgo-html", "wiki-zh", "wiki-en",
+    })
 
     CATEGORY_HINTS = {
         "系统软件": {
@@ -476,8 +485,10 @@ class OnlineCategoryClassifier:
         self._lock = threading.Lock()
         self._cache: dict[str, tuple[float, CategoryLookupResult]] = {}
         self._pending: set[str] = set()
+        self._queued: deque[tuple[str, str, str, str]] = deque()
         self._last_request_at = 0.0
         self._active_workers = 0
+        self._provider_unavailable_until: dict[str, float] = {}
         self.last_error = ""
         self.last_source = ""
         self.last_query = ""
@@ -507,23 +518,34 @@ class OnlineCategoryClassifier:
             if len(self._pending) >= self.max_pending:
                 self.last_error = "Online category queue full"
                 return
-            if self._active_workers >= self.max_workers:
-                return  # Drop request if too many workers are already running
             self._pending.add(key)
+            self._queued.append((key, exe_name, domain, title))
+            jobs = self._take_queued_jobs_locked()
+        self._start_workers(jobs)
+
+    def _take_queued_jobs_locked(self) -> list[tuple[str, str, str, str]]:
+        jobs = []
+        while self._queued and self._active_workers < self.max_workers:
+            jobs.append(self._queued.popleft())
             self._active_workers += 1
-        try:
-            thread = threading.Thread(
-                target=self._worker,
-                args=(key, exe_name, domain, title),
-                name="UsageWidgetCategoryLookup",
-                daemon=True,
-            )
-            thread.start()
-        except Exception as exc:
-            with self._lock:
-                self._pending.discard(key)
-                self._active_workers -= 1
-                self.last_error = f"Thread start failed: {exc}"
+        return jobs
+
+    def _start_workers(self, jobs: list[tuple[str, str, str, str]]) -> None:
+        for job in jobs:
+            try:
+                threading.Thread(
+                    target=self._worker,
+                    args=job,
+                    name="UsageWidgetCategoryLookup",
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                with self._lock:
+                    self._pending.discard(job[0])
+                    self._active_workers = max(0, self._active_workers - 1)
+                    self.last_error = f"Thread start failed: {exc}"
+                    next_jobs = self._take_queued_jobs_locked()
+                self._start_workers(next_jobs)
 
     def lookup_sync(self, exe_name: str, domain: str = "", title: str = "") -> CategoryLookupResult:
         key = self._key(exe_name, domain, title)
@@ -563,7 +585,9 @@ class OnlineCategoryClassifier:
         finally:
             with self._lock:
                 self._pending.discard(key)
-                self._active_workers -= 1
+                self._active_workers = max(0, self._active_workers - 1)
+                jobs = self._take_queued_jobs_locked()
+            self._start_workers(jobs)
 
     def _lookup(self, exe_name: str, domain: str, title: str) -> CategoryLookupResult:
         title_for_lookup = clean_lookup_title(domain, title)
@@ -588,26 +612,31 @@ class OnlineCategoryClassifier:
 
         providers = []
         if domain and not self._is_generic_content_domain(domain):
-            providers.append(lambda: self._lookup_site_metadata(query, domain))
-        providers.append(lambda: self._lookup_baidu(query, domain))
+            providers.append(("site-meta", lambda: self._lookup_site_metadata(query, domain)))
+        providers.append(("baidu", lambda: self._lookup_baidu(query, domain)))
         providers.extend(
             [
-                lambda: self._lookup_duckduckgo(query, domain),
-                lambda: self._lookup_duckduckgo_html(query, domain),
-                lambda: self._lookup_wikipedia(query, domain, "zh"),
-                lambda: self._lookup_wikipedia(query, domain, "en"),
+                ("duckduckgo", lambda: self._lookup_duckduckgo(query, domain)),
+                ("duckduckgo-html", lambda: self._lookup_duckduckgo_html(query, domain)),
+                ("wiki-zh", lambda: self._lookup_wikipedia(query, domain, "zh")),
+                ("wiki-en", lambda: self._lookup_wikipedia(query, domain, "en")),
             ]
         )
 
         best = CategoryLookupResult("其他", 0.0, "multi")
         provider_errors = []
-        for provider in providers:
+        for provider_name, provider in providers:
+            if not self._provider_is_available(provider_name):
+                provider_errors.append(f"{provider_name}: cooldown")
+                continue
             try:
                 result = provider()
             except Exception as exc:
-                provider_errors.append(f"{type(exc).__name__}: {exc}")
+                self._record_provider_failure(provider_name)
+                provider_errors.append(f"{provider_name}: {type(exc).__name__}: {exc}")
                 self.last_error = provider_errors[-1]
                 continue
+            self._record_provider_success(provider_name)
             candidate = result if result.category != "其他" else None
             if result.source in {"duckduckgo", "duckduckgo-html", "baidu"} and result.summary:
                 fallback_category, fallback_conf = self._classify_text(" ".join((query, result.summary)))
@@ -626,6 +655,29 @@ class OnlineCategoryClassifier:
         if provider_errors:
             self.last_error = self.last_provider_errors
         return CategoryLookupResult("其他", 0.0, "multi")
+
+    @classmethod
+    def is_remote_source(cls, source: str) -> bool:
+        return source in cls.REMOTE_SOURCES
+
+    def _provider_is_available(self, provider_name: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            unavailable_until = self._provider_unavailable_until.get(provider_name, 0.0)
+            if unavailable_until <= now:
+                self._provider_unavailable_until.pop(provider_name, None)
+                return True
+            return False
+
+    def _record_provider_failure(self, provider_name: str) -> None:
+        with self._lock:
+            self._provider_unavailable_until[provider_name] = (
+                time.monotonic() + self.PROVIDER_FAILURE_COOLDOWN_SECONDS
+            )
+
+    def _record_provider_success(self, provider_name: str) -> None:
+        with self._lock:
+            self._provider_unavailable_until.pop(provider_name, None)
 
     def _is_generic_content_domain(self, domain: str) -> bool:
         return is_generic_content_domain(domain)
@@ -679,6 +731,8 @@ class OnlineCategoryClassifier:
     def _lookup_baidu(self, query: str, domain: str) -> CategoryLookupResult:
         params = urllib.parse.urlencode({"wd": query})
         text = self._fetch_text(f"https://www.baidu.com/s?{params}")
+        if self._is_access_challenge(text):
+            raise ProviderResponseError("Baidu returned an access challenge")
         pieces = []
         title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
         if title_match:
@@ -716,6 +770,8 @@ class OnlineCategoryClassifier:
     def _lookup_duckduckgo_html(self, query: str, domain: str) -> CategoryLookupResult:
         params = urllib.parse.urlencode({"q": query})
         text = self._fetch_text(f"https://duckduckgo.com/html/?{params}")
+        if self._is_access_challenge(text):
+            raise ProviderResponseError("DuckDuckGo returned an access challenge")
         pieces = []
         for pattern in (
             r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>',
@@ -748,24 +804,29 @@ class OnlineCategoryClassifier:
             "origin": "*",
             "srlimit": "5",
         })
-        try:
-            data = self._fetch_json(f"{base}?{params}")
-            snippets = []
-            for item in data.get("query", {}).get("search", [])[:5]:
-                title_wiki = str(item.get("title", ""))
-                snippet = str(item.get("snippet", ""))
-                # Strip HTML tags from snippet
-                snippet = re.sub(r"<[^>]+>", "", snippet)
-                snippets.append(f"{title_wiki}: {snippet}")
-            summary = " ".join(snippets).strip()
-            if not summary:
-                return CategoryLookupResult("其他", 0.0, f"wiki-{lang}")
-            category, confidence = self._classify_text(" ".join((query, summary)))
-            if category == "其他" and domain:
-                category, confidence = self._classify_text(domain)
-            return CategoryLookupResult(category, confidence, f"wiki-{lang}", summary[:260])
-        except Exception:
+        data = self._fetch_json(f"{base}?{params}")
+        snippets = []
+        for item in data.get("query", {}).get("search", [])[:5]:
+            title_wiki = str(item.get("title", ""))
+            snippet = str(item.get("snippet", ""))
+            # Strip HTML tags from snippet.
+            snippet = re.sub(r"<[^>]+>", "", snippet)
+            snippets.append(f"{title_wiki}: {snippet}")
+        summary = " ".join(snippets).strip()
+        if not summary:
             return CategoryLookupResult("其他", 0.0, f"wiki-{lang}")
+        category, confidence = self._classify_text(" ".join((query, summary)))
+        if category == "其他" and domain:
+            category, confidence = self._classify_text(domain)
+        return CategoryLookupResult(category, confidence, f"wiki-{lang}", summary[:260])
+
+    @staticmethod
+    def _is_access_challenge(text: str) -> bool:
+        normalized = (text or "").casefold()
+        return any(marker in normalized for marker in (
+            "百度安全验证", "安全验证", "请输入验证码", "verify you are human",
+            "captcha", "unusual traffic", "cf-chl-",
+        ))
 
     def _query(self, exe_name: str, domain: str, title: str) -> str:
         domain = (domain or "").strip()

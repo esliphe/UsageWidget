@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from dataclasses import dataclass
 
 from . import __version__
@@ -50,9 +51,11 @@ class OnlineMusicVerifier:
         self.lastfm_api_key = (lastfm_api_key or os.getenv("USAGEWIDGET_LASTFM_API_KEY", "")).strip()
         self.error_ttl_seconds = 600.0
         self.max_workers = 5
+        self.max_pending = 80
         self._lock = threading.Lock()
         self._cache: dict[str, tuple[float, MusicLookupResult]] = {}
         self._pending: set[str] = set()
+        self._queued: deque[tuple[str, str, str]] = deque()
         self._last_request_at = 0.0
         self._active_workers = 0
         self.last_error = ""
@@ -79,18 +82,37 @@ class OnlineMusicVerifier:
         with self._lock:
             if key in self._pending or key in self._cache:
                 return
-            if self._active_workers >= self.max_workers:
+            if len(self._pending) >= self.max_pending:
+                self.last_error = "Online music queue full"
                 return
             self._pending.add(key)
+            self._queued.append((key, title, domain))
+            jobs = self._take_queued_jobs_locked()
+        self._start_workers(jobs)
+
+    def _take_queued_jobs_locked(self) -> list[tuple[str, str, str]]:
+        jobs = []
+        while self._queued and self._active_workers < self.max_workers:
+            jobs.append(self._queued.popleft())
             self._active_workers += 1
-        try:
-            thread = threading.Thread(target=self._worker, args=(key, title, domain), name="UsageWidgetMusicLookup", daemon=True)
-            thread.start()
-        except Exception as exc:
-            with self._lock:
-                self._pending.discard(key)
-                self._active_workers -= 1
-                self.last_error = f"Thread start failed: {exc}"
+        return jobs
+
+    def _start_workers(self, jobs: list[tuple[str, str, str]]) -> None:
+        for job in jobs:
+            try:
+                threading.Thread(
+                    target=self._worker,
+                    args=job,
+                    name="UsageWidgetMusicLookup",
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                with self._lock:
+                    self._pending.discard(job[0])
+                    self._active_workers = max(0, self._active_workers - 1)
+                    self.last_error = f"Thread start failed: {exc}"
+                    next_jobs = self._take_queued_jobs_locked()
+                self._start_workers(next_jobs)
 
     def _worker(self, key: str, title: str, domain: str) -> None:
         try:
@@ -116,7 +138,9 @@ class OnlineMusicVerifier:
         finally:
             with self._lock:
                 self._pending.discard(key)
-                self._active_workers -= 1
+                self._active_workers = max(0, self._active_workers - 1)
+                jobs = self._take_queued_jobs_locked()
+            self._start_workers(jobs)
 
     def _lookup(self, title: str, domain: str) -> MusicLookupResult:
         song, artist, label = parse_music_identity(title, source="browser", domain=domain)

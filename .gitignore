@@ -1,32 +1,5 @@
-# Python / local environment
-.venv/
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Build outputs
 build/
 dist/
-UsageWidget/
-*.spec.bak
-
-# Local runtime data
-*.db
-*.db-shm
-*.db-wal
-*.sqlite
-*.sqlite3
-*.log
-
-# Smoke-test exports and temporary reports
-*-smoke*.csv
-*-smoke*.html
-*-smoke*.png
-*preview*.png
-readonly-test-local*/
-
-# Editor / OS files
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
+release/
+__pycache__/
+*.py[cod]

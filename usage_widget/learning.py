@@ -7,9 +7,11 @@ import time
 import urllib.parse
 import urllib.request
 import html as html_lib
+from collections import deque
 from dataclasses import dataclass
 
 from .classification import clean_lookup_title
+from .online_category import ProviderResponseError
 
 
 USER_AGENT = "UsageWidget"
@@ -351,20 +353,25 @@ def should_mark_learning(category: str, topic: str, domain: str, text: str, kind
 
 class OnlineLearningTopicClassifier:
     MAX_CACHE_SIZE = 1200
+    PROVIDER_FAILURE_COOLDOWN_SECONDS = 120.0
 
     def __init__(self, min_interval: float = 12.0, ttl_seconds: float = 7 * 86400.0) -> None:
         self.min_interval = min_interval
         self.ttl_seconds = ttl_seconds
         self.error_ttl_seconds = 900.0
         self.max_workers = 6
+        self.max_pending = 80
         self._lock = threading.Lock()
         self._cache: dict[str, tuple[float, LearningTopicResult]] = {}
         self._pending: set[str] = set()
+        self._queued: deque[tuple[str, str, str, str]] = deque()
         self._last_request_at = 0.0
         self._active_workers = 0
+        self._provider_unavailable_until: dict[str, float] = {}
         self.last_error = ""
         self.last_source = ""
         self.last_query = ""
+        self.last_provider_errors = ""
 
     def cached(self, domain: str, title: str, description: str = "") -> LearningTopicResult | None:
         key = self._key(domain, title, description)
@@ -387,23 +394,37 @@ class OnlineLearningTopicClassifier:
         with self._lock:
             if key in self._pending or key in self._cache:
                 return
-            if self._active_workers >= self.max_workers:
+            if len(self._pending) >= self.max_pending:
+                self.last_error = "Online learning queue full"
                 return
             self._pending.add(key)
+            self._queued.append((key, domain, title, description))
+            jobs = self._take_queued_jobs_locked()
+        self._start_workers(jobs)
+
+    def _take_queued_jobs_locked(self) -> list[tuple[str, str, str, str]]:
+        jobs = []
+        while self._queued and self._active_workers < self.max_workers:
+            jobs.append(self._queued.popleft())
             self._active_workers += 1
-        try:
-            thread = threading.Thread(
-                target=self._worker,
-                args=(key, domain, title, description),
-                name="UsageWidgetLearningTopicLookup",
-                daemon=True,
-            )
-            thread.start()
-        except Exception as exc:
-            with self._lock:
-                self._pending.discard(key)
-                self._active_workers -= 1
-                self.last_error = f"Thread start failed: {exc}"
+        return jobs
+
+    def _start_workers(self, jobs: list[tuple[str, str, str, str]]) -> None:
+        for job in jobs:
+            try:
+                threading.Thread(
+                    target=self._worker,
+                    args=job,
+                    name="UsageWidgetLearningTopicLookup",
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                with self._lock:
+                    self._pending.discard(job[0])
+                    self._active_workers = max(0, self._active_workers - 1)
+                    self.last_error = f"Thread start failed: {exc}"
+                    next_jobs = self._take_queued_jobs_locked()
+                self._start_workers(next_jobs)
 
     def _worker(self, key: str, domain: str, title: str, description: str) -> None:
         try:
@@ -417,7 +438,8 @@ class OnlineLearningTopicClassifier:
             with self._lock:
                 self._cache[key] = (time.monotonic(), result)
                 self._evict_locked()
-                self.last_error = ""
+                if result.topic or result.source not in {"multi", "error"}:
+                    self.last_error = ""
                 self.last_source = result.source
         except Exception as exc:
             with self._lock:
@@ -426,7 +448,9 @@ class OnlineLearningTopicClassifier:
         finally:
             with self._lock:
                 self._pending.discard(key)
-                self._active_workers -= 1
+                self._active_workers = max(0, self._active_workers - 1)
+                jobs = self._take_queued_jobs_locked()
+            self._start_workers(jobs)
 
     def _lookup(self, domain: str, title: str, description: str) -> LearningTopicResult:
         clean_title = clean_lookup_title(domain, title)
@@ -447,31 +471,61 @@ class OnlineLearningTopicClassifier:
 
         providers = []
         if re.search(r"[\u4e00-\u9fff]", query):
-            providers.append(lambda: self._lookup_baidu(query, query_text, domain_clean, title))
+            providers.append(("baidu", lambda: self._lookup_baidu(query, query_text, domain_clean, title)))
         providers.extend(
             [
-                lambda: self._lookup_duckduckgo(query, query_text, domain_clean, title),
-                lambda: self._lookup_wikipedia(query, query_text, domain_clean, title, "zh"),
-                lambda: self._lookup_wikipedia(query, query_text, domain_clean, title, "en"),
+                ("duckduckgo", lambda: self._lookup_duckduckgo(query, query_text, domain_clean, title)),
+                ("wiki-zh", lambda: self._lookup_wikipedia(query, query_text, domain_clean, title, "zh")),
+                ("wiki-en", lambda: self._lookup_wikipedia(query, query_text, domain_clean, title, "en")),
             ]
         )
         if not re.search(r"[\u4e00-\u9fff]", query):
-            providers.append(lambda: self._lookup_baidu(query, query_text, domain_clean, title))
+            providers.append(("baidu", lambda: self._lookup_baidu(query, query_text, domain_clean, title)))
 
-        for provider in providers:
+        provider_errors = []
+        for provider_name, provider in providers:
+            if not self._provider_is_available(provider_name):
+                provider_errors.append(f"{provider_name}: cooldown")
+                continue
             try:
                 result = provider()
             except Exception as exc:
-                self.last_error = f"{type(exc).__name__}: {exc}"
+                self._record_provider_failure(provider_name)
+                self.last_error = f"{provider_name}: {type(exc).__name__}: {exc}"
+                provider_errors.append(self.last_error)
                 continue
+            self._record_provider_success(provider_name)
             if result.topic:
+                self.last_provider_errors = " | ".join(provider_errors[-3:])
                 return result
 
+        self.last_provider_errors = " | ".join(provider_errors[-3:])
         return LearningTopicResult("", 0.0, "multi")
+
+    def _provider_is_available(self, provider_name: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            unavailable_until = self._provider_unavailable_until.get(provider_name, 0.0)
+            if unavailable_until <= now:
+                self._provider_unavailable_until.pop(provider_name, None)
+                return True
+            return False
+
+    def _record_provider_failure(self, provider_name: str) -> None:
+        with self._lock:
+            self._provider_unavailable_until[provider_name] = (
+                time.monotonic() + self.PROVIDER_FAILURE_COOLDOWN_SECONDS
+            )
+
+    def _record_provider_success(self, provider_name: str) -> None:
+        with self._lock:
+            self._provider_unavailable_until.pop(provider_name, None)
 
     def _lookup_baidu(self, query: str, query_text: str, domain_clean: str, title: str) -> LearningTopicResult:
         params = urllib.parse.urlencode({"wd": query})
         text = self._fetch_text(f"https://www.baidu.com/s?{params}")
+        if self._is_access_challenge(text):
+            raise ProviderResponseError("Baidu returned an access challenge")
         pieces = []
         title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
         if title_match:
@@ -533,29 +587,34 @@ class OnlineLearningTopicClassifier:
             "origin": "*",
             "srlimit": "6",
         })
-        try:
-            data = self._fetch_json(f"{base}?{params}")
-            snippets = []
-            for item in data.get("query", {}).get("search", [])[:6]:
-                title_wiki = str(item.get("title", ""))
-                snippet = str(item.get("snippet", ""))
-                snippet = re.sub(r"<[^>]+>", "", snippet)
-                snippets.append(f"{title_wiki}: {snippet}")
-            summary = normalize_text(*snippets)
-            if not summary:
-                return LearningTopicResult("", 0.0, f"wiki-{lang}")
-            combined = normalize_text(query_text, summary)
-            local = local_learning_topic(combined)
-            if local.topic:
-                conf = max(local.confidence, 0.60)
-                return LearningTopicResult(local.topic, conf, f"wiki-{lang}", summary[:300])
-            if "bilibili" in domain_clean or domain_clean.endswith("b23.tv") or "youtube" in domain_clean:
-                alt = local_learning_topic(normalize_text(clean_lookup_title(domain_clean, title)[:200], summary[:200]))
-                if alt.topic:
-                    return LearningTopicResult(alt.topic, max(alt.confidence, 0.55), f"wiki-{lang}", summary[:300])
-            return LearningTopicResult("", 0.0, f"wiki-{lang}", summary[:300])
-        except Exception:
+        data = self._fetch_json(f"{base}?{params}")
+        snippets = []
+        for item in data.get("query", {}).get("search", [])[:6]:
+            title_wiki = str(item.get("title", ""))
+            snippet = str(item.get("snippet", ""))
+            snippet = re.sub(r"<[^>]+>", "", snippet)
+            snippets.append(f"{title_wiki}: {snippet}")
+        summary = normalize_text(*snippets)
+        if not summary:
             return LearningTopicResult("", 0.0, f"wiki-{lang}")
+        combined = normalize_text(query_text, summary)
+        local = local_learning_topic(combined)
+        if local.topic:
+            conf = max(local.confidence, 0.60)
+            return LearningTopicResult(local.topic, conf, f"wiki-{lang}", summary[:300])
+        if "bilibili" in domain_clean or domain_clean.endswith("b23.tv") or "youtube" in domain_clean:
+            alt = local_learning_topic(normalize_text(clean_lookup_title(domain_clean, title)[:200], summary[:200]))
+            if alt.topic:
+                return LearningTopicResult(alt.topic, max(alt.confidence, 0.55), f"wiki-{lang}", summary[:300])
+        return LearningTopicResult("", 0.0, f"wiki-{lang}", summary[:300])
+
+    @staticmethod
+    def _is_access_challenge(text: str) -> bool:
+        normalized = (text or "").casefold()
+        return any(marker in normalized for marker in (
+            "百度安全验证", "安全验证", "请输入验证码", "verify you are human",
+            "captcha", "unusual traffic", "cf-chl-",
+        ))
 
     def _fetch_json(self, url: str) -> dict:
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})

@@ -41,25 +41,69 @@ def format_axis_duration(seconds: float) -> str:
     return format_duration(seconds)
 
 
-def draw_empty_state(painter: QPainter, rect: QRectF, message: str) -> None:
+def is_dark_surface(widget: QWidget) -> bool:
+    return widget.palette().color(widget.backgroundRole()).lightness() < 128
+
+
+def chart_theme(widget: QWidget) -> dict[str, QColor]:
+    if is_dark_surface(widget):
+        return {
+            "title": QColor("#f5f7fb"),
+            "text": QColor("#dbe5f1"),
+            "muted": QColor("#b5c3d5"),
+            "grid": QColor("#3c4758"),
+            "track": QColor("#303b4a"),
+            "highlight": QColor("#283746"),
+            "inner": QColor("#202733"),
+            "tooltip": QColor("#10151d"),
+            "empty_fill": QColor("#202733"),
+            "empty_bars": QColor("#425166"),
+        }
+    return {
+        "title": QColor("#17202a"),
+        "text": QColor("#273449"),
+        "muted": QColor("#738196"),
+        "grid": QColor("#d9e1ea"),
+        "track": QColor("#e8eef5"),
+        "highlight": QColor("#f8fafc"),
+        "inner": QColor("#f6f8fb"),
+        "tooltip": QColor("#17202a"),
+        "empty_fill": QColor("#f8fafc"),
+        "empty_bars": QColor("#dbe5f0"),
+    }
+
+
+def draw_empty_state(painter: QPainter, rect: QRectF, message: str, theme: dict[str, QColor] | None = None) -> None:
+    theme = theme or {
+        "title": QColor("#17202a"),
+        "text": QColor("#273449"),
+        "muted": QColor("#738196"),
+        "grid": QColor("#d9e1ea"),
+        "track": QColor("#e8eef5"),
+        "highlight": QColor("#f8fafc"),
+        "inner": QColor("#f6f8fb"),
+        "tooltip": QColor("#17202a"),
+        "empty_fill": QColor("#f8fafc"),
+        "empty_bars": QColor("#dbe5f0"),
+    }
     painter.save()
     box = rect.adjusted(18, 34, -18, -18)
     if box.width() < 80 or box.height() < 44:
         box = rect.adjusted(12, 28, -12, -12)
-    pen = QPen(QColor("#cbd5e1"))
+    pen = QPen(theme["grid"])
     pen.setStyle(Qt.PenStyle.DashLine)
     painter.setPen(pen)
-    painter.setBrush(QColor("#f8fafc"))
+    painter.setBrush(theme["empty_fill"])
     painter.drawRoundedRect(box, 8, 8)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#dbe5f0"))
+    painter.setBrush(theme["empty_bars"])
     base_y = box.center().y() + 12
     bar_w = max(6.0, min(12.0, box.width() / 16))
     gap = bar_w * 0.8
     start_x = box.center().x() - (bar_w * 4 + gap * 3) / 2
     for i, height in enumerate((14, 24, 18, 30)):
         painter.drawRoundedRect(QRectF(start_x + i * (bar_w + gap), base_y - height, bar_w, height), 3, 3)
-    painter.setPen(QColor("#738196"))
+    painter.setPen(theme["muted"])
     painter.drawText(box.adjusted(10, 0, -10, -10), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom, message)
     painter.restore()
 
@@ -387,6 +431,7 @@ class HourlyActivityChart(QWidget):
 
     def _draw_badges(self, painter: QPainter, rect: QRectF, summary: dict[str, float | int]) -> None:
         painter.save()
+        colors = chart_theme(self)
         font = painter.font()
         font.setBold(False)
         font.setPointSize(8)
@@ -404,10 +449,10 @@ class HourlyActivityChart(QWidget):
             if x < rect.left() + 155:
                 break
             badge = QRectF(x, rect.top(), width, 24)
-            painter.setPen(QColor("#d9e1ea"))
-            painter.setBrush(QColor("#f8fafc"))
+            painter.setPen(colors["grid"])
+            painter.setBrush(colors["highlight"])
             painter.drawRoundedRect(badge, 7, 7)
-            painter.setPen(QColor("#475569"))
+            painter.setPen(colors["text"])
             painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
             x -= 7
         painter.restore()
@@ -420,6 +465,7 @@ class HourlyActivityChart(QWidget):
         summary: dict[str, float | int],
     ) -> None:
         painter.save()
+        colors = chart_theme(self)
         font = painter.font()
         font.setBold(False)
         font.setPointSize(8)
@@ -441,7 +487,7 @@ class HourlyActivityChart(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(self.COLORS[key])
             painter.drawRoundedRect(QRectF(x, line_y + 5, 10, 10), 3, 3)
-            painter.setPen(QColor("#273449"))
+            painter.setPen(colors["text"])
             painter.drawText(QRectF(x + 16, line_y, width - 16, 20), Qt.AlignmentFlag.AlignVCenter, text)
             x += width + 12
         painter.restore()
@@ -508,16 +554,21 @@ class HourlyActivityChart(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect())
         self._bar_rects = []
+        colors = chart_theme(self)
 
-        painter.setPen(QColor("#17202a"))
+        painter.setPen(colors["title"])
         title_font = painter.font()
         title_font.setBold(True)
         title_font.setPointSize(10)
         painter.setFont(title_font)
         painter.drawText(QRectF(14, 9, rect.width() - 28, 24), Qt.AlignmentFlag.AlignLeft, self.title)
 
-        if not self.data:
-            draw_empty_state(painter, rect, "暂无时间线数据")
+        has_activity = any(
+            max(focus, video, music, learning) > 0
+            for _hour, focus, video, music, learning in self.data
+        )
+        if not self.data or not has_activity:
+            draw_empty_state(painter, rect, "当前范围暂无小时活动数据", colors)
             painter.end()
             return
 
@@ -526,7 +577,7 @@ class HourlyActivityChart(QWidget):
             self._draw_badges(painter, QRectF(14, 8, rect.width() - 28, 24), summary)
             chart_top = 58
         else:
-            painter.setPen(QColor("#64748b"))
+            painter.setPen(colors["muted"])
             compact = (
                 f"前台 {format_duration(float(summary['focus']))} · "
                 f"峰值 {int(summary['peak_hour']):02d}:00"
@@ -553,11 +604,11 @@ class HourlyActivityChart(QWidget):
         axis_ticks = ((0.5, format_axis_duration(max_value * 0.5)), (1.0, format_axis_duration(max_value)))
         for ratio, label in axis_ticks:
             y = chart.bottom() - chart.height() * ratio
-            painter.setPen(QColor("#edf2f7"))
+            painter.setPen(colors["grid"])
             painter.drawLine(int(chart.left()), int(y), int(chart.right()), int(y))
-            painter.setPen(QColor("#94a3b8"))
+            painter.setPen(colors["muted"])
             painter.drawText(QRectF(6, y - 8, chart.left() - 12, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, label)
-        painter.setPen(QColor("#d9e1ea"))
+        painter.setPen(colors["grid"])
         painter.drawLine(int(chart.left()), int(chart.bottom()), int(chart.right()), int(chart.bottom()))
         painter.setPen(Qt.PenStyle.NoPen)
 
@@ -568,13 +619,13 @@ class HourlyActivityChart(QWidget):
             x = slot_left + max(0.0, (hour_slot - cluster_width) / 2)
             slot_rect = QRectF(slot_left, chart.top(), hour_slot, chart.height())
             if 8 <= hour <= 11:
-                painter.setBrush(QColor("#f8fafc"))
+                painter.setBrush(colors["highlight"])
                 painter.drawRoundedRect(slot_rect, 3, 3)
             if self._hover_hour == hour:
                 painter.setBrush(QColor(22, 119, 210, 32))
                 painter.drawRoundedRect(slot_rect.adjusted(1, 0, -1, 0), 5, 5)
             if max(focus, video, music) <= 0:
-                painter.setBrush(QColor("#e8eef5"))
+                painter.setBrush(colors["track"])
                 painter.drawRoundedRect(QRectF(x, chart.bottom() - px(self, 4, 4), cluster_width, px(self, 4, 4)), 2, 2)
             else:
                 for series_index, (value, key) in enumerate(((focus, "focus"), (video, "video"), (music, "music"))):
@@ -595,7 +646,7 @@ class HourlyActivityChart(QWidget):
                 peak_height = max(px(self, 4, 4), chart.height() * (max(focus, video, music, learn) / max_value))
                 peak_rect = QRectF(slot_left + 1, chart.bottom() - peak_height - 3, hour_slot - 2, peak_height + 5)
                 painter.setBrush(QColor(22, 119, 210, 28))
-                painter.setPen(QColor("#17202a"))
+                painter.setPen(colors["title"])
                 painter.drawRoundedRect(peak_rect, 5, 5)
                 painter.setPen(Qt.PenStyle.NoPen)
             self._bar_rects.append((slot_rect, hour, focus, video, music, learn))
@@ -604,7 +655,7 @@ class HourlyActivityChart(QWidget):
             label_width = 84
             label_x = min(max(chart.left(), peak_rect.center().x() - label_width / 2), chart.right() - label_width)
             label_rect = QRectF(label_x, max(34, peak_rect.top() - 22), label_width, 18)
-            painter.setBrush(QColor("#17202a"))
+            painter.setBrush(colors["tooltip"])
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawRoundedRect(label_rect, 6, 6)
             painter.setPen(QColor("#ffffff"))
@@ -616,7 +667,7 @@ class HourlyActivityChart(QWidget):
         axis_font.setBold(False)
         axis_font.setPointSize(8)
         painter.setFont(axis_font)
-        painter.setPen(QColor("#738196"))
+        painter.setPen(colors["muted"])
         label_hours = (0, 3, 6, 9, 12, 15, 18, 21, 23) if rect.width() >= 560 else (0, 6, 12, 18, 23)
         for hour in label_hours:
             x = chart.left() + hour * hour_slot + hour_slot / 2
@@ -624,7 +675,7 @@ class HourlyActivityChart(QWidget):
 
         hint_y = chart.bottom() + 29
         if rect.width() >= 500:
-            painter.setPen(QColor("#94a3b8"))
+            painter.setPen(colors["muted"])
             painter.drawText(QRectF(chart.left(), hint_y, chart.width(), 18), Qt.AlignmentFlag.AlignLeft, "每小时三柱分别为前台、视频、音乐；绿色圆点表示学习标记")
             legend_y = hint_y + 23
         else:
@@ -693,7 +744,14 @@ class HeatmapWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = self.rect()
-        painter.setPen(QColor("#17202a"))
+        colors = chart_theme(self)
+        heat_colors = self.COLORS
+        if is_dark_surface(self):
+            heat_colors = [
+                QColor("#303b4a"), QColor("#315576"), QColor("#4b83b5"),
+                QColor(app_color("focus")), QColor("#71b7ff"),
+            ]
+        painter.setPen(colors["title"])
         font = painter.font()
         font.setBold(True)
         font.setPointSize(10)
@@ -702,7 +760,7 @@ class HeatmapWidget(QWidget):
         painter.drawText(QRectF(12, 6, rect.width() - 24, 22), Qt.AlignmentFlag.AlignLeft, title_text)
         self._cell_rects = []
         if not self.data:
-            draw_empty_state(painter, QRectF(rect), "暂无足够数据（需使用 1 天以上）")
+            draw_empty_state(painter, QRectF(rect), "暂无足够数据（需使用 1 天以上）", colors)
             painter.end()
             return
         max_val = max(v for _, v in self.data) or 1.0
@@ -717,7 +775,7 @@ class HeatmapWidget(QWidget):
             peak_font.setBold(False)
             peak_font.setPointSize(8)
             painter.setFont(peak_font)
-            painter.setPen(QColor("#64748b"))
+            painter.setPen(colors["muted"])
             painter.drawText(
                 QRectF(12, 7, rect.width() - 24, 20),
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
@@ -737,7 +795,7 @@ class HeatmapWidget(QWidget):
         month_font.setPointSize(6)
         month_font.setBold(False)
         painter.setFont(month_font)
-        painter.setPen(QColor("#738196"))
+        painter.setPen(colors["muted"])
         seen_months: set[str] = set()
         for idx, (date_str, _value) in enumerate(self.data):
             try:
@@ -754,9 +812,9 @@ class HeatmapWidget(QWidget):
             col = idx // 7
             row = idx % 7
             ratio = value / max_val if max_val > 0 else 0
-            ci = min(len(self.COLORS) - 1, int(ratio * (len(self.COLORS) - 1) + 0.5)) if value > 0 else 0
+            ci = min(len(heat_colors) - 1, int(ratio * (len(heat_colors) - 1) + 0.5)) if value > 0 else 0
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(self.COLORS[ci])
+            painter.setBrush(heat_colors[ci])
             x = chart_left + col * (cell + cell_gap)
             y = chart_top + row * (cell + cell_gap)
             r = QRectF(x, y, cell, cell)
@@ -765,9 +823,9 @@ class HeatmapWidget(QWidget):
             painter.drawRoundedRect(r, radius, radius)
             if date_str == peak_date and value > 0:
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QColor("#17202a"))
+                painter.setPen(colors["title"])
                 painter.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
-        painter.setPen(QColor("#738196"))
+        painter.setPen(colors["muted"])
         small = painter.font()
         small.setPointSize(6)
         painter.setFont(small)
@@ -781,16 +839,16 @@ class HeatmapWidget(QWidget):
         legend_font = painter.font()
         legend_font.setPointSize(7)
         painter.setFont(legend_font)
-        painter.setPen(QColor("#738196"))
+        painter.setPen(colors["muted"])
         painter.drawText(QRectF(legend_x, legend_y, 20, 14), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "少")
         swatch = px(self, 9, 9)
         x = legend_x + 18
-        for color in self.COLORS:
+        for color in heat_colors:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(QRectF(x, legend_y + 2, swatch, swatch), 2, 2)
             x += swatch + px(self, 2, 2)
-        painter.setPen(QColor("#738196"))
+        painter.setPen(colors["muted"])
         max_label = format_duration(max_val)
         remaining_w = max(0, rect.width() - x - px(self, 8, 8))
         if remaining_w >= 26:
@@ -836,7 +894,11 @@ class GroupedBarChartWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = self.rect()
-        painter.setPen(QColor("#17202a"))
+        colors = chart_theme(self)
+        bar_colors = dict(self.COLORS)
+        if is_dark_surface(self):
+            bar_colors["last"] = QColor("#65768a")
+        painter.setPen(colors["title"])
         font = painter.font()
         font.setBold(True)
         font.setPointSize(10)
@@ -846,12 +908,12 @@ class GroupedBarChartWidget(QWidget):
                          Qt.AlignmentFlag.AlignLeft, title_text)
         self._bar_rects = []
         if not self.this_week:
-            draw_empty_state(painter, QRectF(rect), "暂无数据")
+            draw_empty_state(painter, QRectF(rect), "暂无数据", colors)
             painter.end()
             return
         has_any = any(v > 0 for _, v in self.this_week) or any(v > 0 for _, v in self.last_week)
         if not has_any:
-            draw_empty_state(painter, QRectF(rect), "暂无数据（本周尚未产生记录）")
+            draw_empty_state(painter, QRectF(rect), "暂无数据（本周尚未产生记录）", colors)
             painter.end()
             return
         all_vals = [v for _, v in self.this_week] + [v for _, v in self.last_week]
@@ -866,11 +928,11 @@ class GroupedBarChartWidget(QWidget):
         painter.setFont(axis_font)
         for ratio, label in ((0.5, format_axis_duration(max_val * 0.5)), (1.0, format_axis_duration(max_val))):
             y = chart.bottom() - chart.height() * ratio
-            painter.setPen(QColor("#edf2f7"))
+            painter.setPen(colors["grid"])
             painter.drawLine(int(chart.left()), int(y), int(chart.right()), int(y))
-            painter.setPen(QColor("#94a3b8"))
+            painter.setPen(colors["muted"])
             painter.drawText(QRectF(6, y - 8, chart.left() - 12, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, label)
-        painter.setPen(QColor("#d9e1ea"))
+        painter.setPen(colors["grid"])
         painter.drawLine(int(chart.left()), int(chart.bottom()), int(chart.right()), int(chart.bottom()))
         painter.setPen(Qt.PenStyle.NoPen)
         for i in range(7):
@@ -890,15 +952,15 @@ class GroupedBarChartWidget(QWidget):
                     r1 = r
                 else:
                     r2 = r
-                painter.setBrush(self.COLORS[key])
+                painter.setBrush(bar_colors[key])
                 painter.drawRoundedRect(r, 2, 2)
                 if val > 0 and rect.width() >= 420:
-                    painter.setPen(QColor("#64748b"))
+                    painter.setPen(colors["muted"])
                     label_rect = QRectF(r.left() - 12, r.top() - 16, r.width() + 24, 14)
                     painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, format_duration(val))
                     painter.setPen(Qt.PenStyle.NoPen)
             self._bar_rects.append((r1, r2, day_label, lv, tv))
-            painter.setPen(QColor("#738196"))
+            painter.setPen(colors["muted"])
             ff = painter.font()
             ff.setPointSize(7)
             painter.setFont(ff)
@@ -907,9 +969,9 @@ class GroupedBarChartWidget(QWidget):
         legend_y = rect.height() - 22
         painter.setPen(Qt.PenStyle.NoPen)
         for label, key, lx in (("本周", "this", chart.left()), ("上周", "last", chart.left() + 56)):
-            painter.setBrush(self.COLORS[key])
+            painter.setBrush(bar_colors[key])
             painter.drawRoundedRect(QRectF(lx, legend_y + 4, 10, 10), 3, 3)
-            painter.setPen(QColor("#273449"))
+            painter.setPen(colors["text"])
             painter.drawText(QRectF(lx + 16, legend_y, 40, 18), Qt.AlignmentFlag.AlignVCenter, label)
         painter.end()
 
@@ -959,8 +1021,9 @@ class DonutChartWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = self.rect()
         self._legend_rects = []
+        colors = chart_theme(self)
 
-        painter.setPen(QColor("#17202a"))
+        painter.setPen(colors["title"])
         font = painter.font()
         font.setBold(True)
         font.setPointSize(10)
@@ -970,7 +1033,7 @@ class DonutChartWidget(QWidget):
         totals = [(name, attention, background, attention + background) for name, attention, background in self.data if attention + background > 0]
         total = sum(value for *_rest, value in totals)
         if total <= 0:
-            draw_empty_state(painter, QRectF(rect), "暂无分类数据")
+            draw_empty_state(painter, QRectF(rect), "暂无分类数据", colors)
             painter.end()
             return
 
@@ -986,9 +1049,9 @@ class DonutChartWidget(QWidget):
             row_height = max(px(self, 22, 22), (rect.height() - chart_top - 16 - row_gap * max(0, len(totals) - 1)) / len(totals))
             max_value = max(value for *_rest, value in totals) or 1.0
             metrics = painter.fontMetrics()
-            text_color = QColor("#273449")
-            muted_color = QColor("#738196")
-            track_color = QColor("#e8eef5")
+            text_color = colors["text"]
+            muted_color = colors["muted"]
+            track_color = colors["track"]
 
             for index, (name, attention, background, value) in enumerate(totals[:7]):
                 y = chart_top + index * (row_height + row_gap)
@@ -1026,10 +1089,10 @@ class DonutChartWidget(QWidget):
             painter.drawPie(pie_rect, start_angle, span)
             start_angle += span
 
-        painter.setBrush(QColor("#f6f8fb"))
+        painter.setBrush(colors["inner"])
         inner = pie_rect.adjusted(side * 0.24, side * 0.24, -side * 0.24, -side * 0.24)
         painter.drawEllipse(inner)
-        painter.setPen(QColor("#17202a"))
+        painter.setPen(colors["title"])
         center_font = painter.font()
         center_font.setBold(True)
         center_font.setPointSize(12)
@@ -1039,7 +1102,7 @@ class DonutChartWidget(QWidget):
         sub_font.setBold(False)
         sub_font.setPointSize(8)
         painter.setFont(sub_font)
-        painter.setPen(QColor("#738196"))
+        painter.setPen(colors["muted"])
         painter.drawText(inner.adjusted(0, 18, 0, 0), Qt.AlignmentFlag.AlignCenter, "注视+播放")
 
         legend_left = int(pie_rect.right() + 18)
@@ -1057,7 +1120,7 @@ class DonutChartWidget(QWidget):
             painter.drawRoundedRect(QRectF(legend_left, y + 5, 10, 10), 3, 3)
             percent = f"{value / total * 100:.0f}%"
             text = metrics.elidedText(f"{name} · {format_duration(value)} · {percent}", Qt.TextElideMode.ElideRight, legend_width - 18)
-            painter.setPen(QColor("#273449"))
+            painter.setPen(colors["text"])
             row_rect = QRectF(legend_left + 18, y, legend_width - 18, 20)
             painter.drawText(row_rect, Qt.AlignmentFlag.AlignVCenter, text)
             self._legend_rects.append((QRectF(legend_left, y, legend_width, 20), name, value, attention, background))

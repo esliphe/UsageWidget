@@ -43,7 +43,7 @@ def main() -> int:
         key = monitor.category_classifier._key("browser", "unknown.example", "Some AI assistant product")
         monitor.category_classifier._cache[key] = (
             time.monotonic(),
-            CategoryLookupResult("AI 工具", 0.90, "test"),
+            CategoryLookupResult("AI 工具", 0.90, "wiki-en"),
         )
         category = monitor._category_for("browser", "unknown.example", "Some AI assistant product", settings)
         check("uses cached online result", category == "AI 工具", f"got {category}")
@@ -66,7 +66,7 @@ def main() -> int:
         key = monitor.category_classifier._key("rareapp.exe", "", "Acme project dashboard")
         monitor.category_classifier._cache[key] = (
             time.monotonic(),
-            CategoryLookupResult("办公", 0.88, "test"),
+            CategoryLookupResult("办公", 0.88, "wiki-en"),
         )
         category = monitor._category_for("rareapp.exe", "", "Acme project dashboard", settings)
         check("uses app online result", category == "办公", f"got {category}")
@@ -90,7 +90,7 @@ def main() -> int:
         key = monitor.category_classifier._key("browser", "developer.vendor-example.com", "SDK reference")
         monitor.category_classifier._cache[key] = (
             time.monotonic(),
-            CategoryLookupResult("编程", 0.86, "test"),
+            CategoryLookupResult("编程", 0.86, "wiki-en"),
         )
         category = monitor._category_for("browser", "developer.vendor-example.com", "SDK reference", settings)
         check("uses domain online result", category == "编程", f"got {category}")
@@ -164,7 +164,7 @@ def main() -> int:
             storage.category_for("", "bilibili.com", "普通视频"),
         )
         storage.add_category_rule("alpha-42", "游戏", "title", update_existing=True, source="user")
-        monitor._remember_online_category_rule("browser", "bilibili.com", "alpha-42", "学习")
+        monitor._remember_online_category_rule("browser", "bilibili.com", "alpha-42", "学习", "wiki-en")
         check(
             "online learned rule does not overwrite user correction",
             storage.category_for("", "bilibili.com", "alpha-42") == "游戏",
@@ -391,7 +391,7 @@ def main() -> int:
         old_lookup_sync = OnlineCategoryClassifier.lookup_sync
 
         def fake_lookup_sync(self, exe_name: str, domain: str = "", title: str = "") -> CategoryLookupResult:
-            return CategoryLookupResult("学习", 0.82, "fake", "research learning dashboard")
+            return CategoryLookupResult("学习", 0.82, "wiki-en", "research learning dashboard")
 
         OnlineCategoryClassifier.lookup_sync = fake_lookup_sync
         try:

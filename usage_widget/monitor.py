@@ -256,8 +256,9 @@ class ProcessMonitor(QObject):
         domain: str,
         title: str,
         category: str,
+        source: str,
     ) -> None:
-        if not category or category == "其他":
+        if not category or category == "其他" or not OnlineCategoryClassifier.is_remote_source(source):
             return
         domain_l = (domain or "").casefold().strip()
         exe_l = (exe_name or "").casefold().strip()
@@ -336,7 +337,9 @@ class ProcessMonitor(QObject):
                 result = self.category_classifier.cached(exe_name, domain, clean_title)
                 if result:
                     if result.category != "其他" and result.confidence >= 0.55:
-                        self._remember_online_category_rule(exe_name, domain, clean_title, result.category)
+                        self._remember_online_category_rule(
+                            exe_name, domain, clean_title, result.category, result.source
+                        )
                         if result.category not in {"视频", "网站", "浏览器"}:
                             return result.category
                 elif len(normalize_text(exe_name, domain, clean_title)) >= 3:
@@ -347,7 +350,9 @@ class ProcessMonitor(QObject):
         result = self.category_classifier.cached(exe_name, domain, clean_title)
         if result:
             if result.category != "其他" and result.confidence >= 0.55:
-                self._remember_online_category_rule(exe_name, domain, clean_title, result.category)
+                self._remember_online_category_rule(
+                    exe_name, domain, clean_title, result.category, result.source
+                )
                 return result.category
         else:
             if len(normalize_text(exe_name, domain, clean_title)) >= 3:

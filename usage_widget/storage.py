@@ -1756,6 +1756,7 @@ class Storage:
                         )
                     )
                 ):
+                    is_remote_result = OnlineCategoryClassifier.is_remote_source(result.source)
                     online_updates.append(
                         (
                             result.category,
@@ -1765,6 +1766,9 @@ class Storage:
                             str(row["content_key"]),
                         )
                     )
+                    if not is_remote_result:
+                        stats["local_updated"] += 1
+                        continue
                     stats["online_updated"] += 1
                     domain_l = domain.casefold().strip()
                     exe_l = exe_name.casefold().strip()
