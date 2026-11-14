@@ -182,11 +182,13 @@ def main() -> int:
     verify_zip(zip_path, entries)
 
     checksums = RELEASE_DIR / f"SHA256SUMS-{version}.txt"
-    checksums.write_text(
-        f"{sha256_of(zip_path)}  {zip_path.name}\n"
-        f"{sha256_of(DIST_APP / 'UsageWidget.exe')}  UsageWidget/UsageWidget.exe\n",
-        encoding="utf-8",
-    )
+    # Only the archive is listed: its contents are covered by its own hash, and
+    # an "UsageWidget/UsageWidget.exe" line would fail `sha256sum -c` when run
+    # from release/ because that path only exists inside the zip.
+    # newline="\n": consumers are Unix tools that treat a stray CR as part of
+    # the filename.
+    with checksums.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(f"{sha256_of(zip_path)}  {zip_path.name}\n")
 
     size_mb = zip_path.stat().st_size / 1024 / 1024
     print(f"==> package: {zip_path} ({size_mb:.1f} MB, {entries} entries)")
